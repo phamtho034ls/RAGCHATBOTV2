@@ -87,16 +87,52 @@ async def invalidate_cache(query: str) -> None:
 
 async def flush_cache() -> None:
     """Clear all cached answers."""
+    await invalidate_all_query_cache()
+
+
+async def invalidate_all_query_cache() -> int:
+    """Xóa toàn bộ query cache (prefix legal_chat:). Giữ embedding cache (in-process)."""
     redis = await _get_redis()
     if not redis:
-        return
-
+        return 0
     try:
         keys = []
         async for key in redis.scan_iter("legal_chat:*"):
             keys.append(key)
         if keys:
             await redis.delete(*keys)
-            log.info("Flushed %d cached answers.", len(keys))
+            log.info("Invalidated %d query cache entries (legal_chat:*).", len(keys))
+        return len(keys)
     except Exception as e:
-        log.warning("Redis FLUSH error: %s", e)
+        log.warning("Redis invalidate_all_query_cache error: %s", e)
+        return 0
+
+
+async def invalidate_cache_for_document(document_id: int) -> int:
+    """Best-effort: xóa cache entries có document_id trong payload JSON (nếu có)."""
+    redis = await _get_redis()
+    if not redis:
+        return 0
+    removed = 0
+    try:
+        async for key in redis.scan_iter("legal_chat:*"):
+            try:
+                raw = await redis.get(key)
+                if not raw:
+                    continue
+                import json as _json
+
+                data = _json.loads(raw)
+                sources = data.get("sources") or []
+                for s in sources:
+                    if s.get("document_id") == document_id:
+                        await redis.delete(key)
+                        removed += 1
+                        break
+            except Exception:
+                continue
+        if removed:
+            log.info("invalidate_cache_for_document: removed %d keys for doc_id=%s", removed, document_id)
+    except Exception as e:
+        log.warning("invalidate_cache_for_document failed: %s", e)
+    return removed

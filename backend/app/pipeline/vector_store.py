@@ -31,7 +31,17 @@ from app.config import (
     QDRANT_HOST,
     QDRANT_PORT,
     QDRANT_API_KEY,
+    QDRANT_RECREATE_ON_DIM_MISMATCH,
 )
+
+# Tránh import vòng: chỉ gọi sau khi embedding model đã warmup
+def _vector_size() -> int:
+    try:
+        from app.pipeline.embedding import get_embedding_dimension
+
+        return int(get_embedding_dimension())
+    except Exception:
+        return int(EMBEDDING_DIM)
 
 log = logging.getLogger(__name__)
 
@@ -53,21 +63,78 @@ def _get_client() -> QdrantClient:
 
 # ── Collection management ─────────────────────────────────
 
+def _collection_vector_dim(client: QdrantClient, collection_name: str) -> Optional[int]:
+    """Đọc kích thước vector đã cấu hình trong Qdrant (single vector hoặc named)."""
+    try:
+        info = client.get_collection(collection_name=collection_name)
+    except Exception:
+        return None
+    params = getattr(info.config, "params", None)
+    if params is None:
+        return None
+    vc = params.vectors
+    if vc is None:
+        return None
+    if hasattr(vc, "size"):
+        return int(vc.size)
+    if isinstance(vc, dict):
+        for v in vc.values():
+            if v is not None and hasattr(v, "size"):
+                return int(v.size)
+    return None
+
+
 def ensure_collection() -> None:
-    """Create the ``law_documents`` collection if it doesn't exist."""
+    """Create the ``law_documents`` collection if it doesn't exist; align dim with embedding model."""
     client = _get_client()
     collections = [c.name for c in client.get_collections().collections]
+    dim = _vector_size()
     if QDRANT_COLLECTION not in collections:
         client.create_collection(
             collection_name=QDRANT_COLLECTION,
             vectors_config=VectorParams(
-                size=EMBEDDING_DIM,
+                size=dim,
                 distance=Distance.COSINE,
             ),
         )
-        log.info("Created Qdrant collection '%s' (dim=%d).", QDRANT_COLLECTION, EMBEDDING_DIM)
-    else:
-        log.info("Qdrant collection '%s' already exists.", QDRANT_COLLECTION)
+        log.info("Created Qdrant collection '%s' (dim=%d).", QDRANT_COLLECTION, dim)
+        return
+
+    existing = _collection_vector_dim(client, QDRANT_COLLECTION)
+    if existing is not None and existing != dim:
+        log.warning(
+            "Qdrant collection '%s' đang dùng vector size=%d nhưng model cần %d.",
+            QDRANT_COLLECTION,
+            existing,
+            dim,
+        )
+        if not QDRANT_RECREATE_ON_DIM_MISMATCH:
+            raise RuntimeError(
+                f"Qdrant '{QDRANT_COLLECTION}': vector dim {existing} != {dim} (model). "
+                "Xóa collection trên Qdrant hoặc bật QDRANT_RECREATE_ON_DIM_MISMATCH=true "
+                "(sẽ xóa toàn bộ point trong collection — chạy scripts/reembed_all.py để nạp lại)."
+            )
+        log.warning(
+            "Đang xóa và tạo lại collection '%s' — toàn bộ vector cũ mất. "
+            "Sau đó chạy: python scripts/reembed_all.py",
+            QDRANT_COLLECTION,
+        )
+        client.delete_collection(collection_name=QDRANT_COLLECTION)
+        client.create_collection(
+            collection_name=QDRANT_COLLECTION,
+            vectors_config=VectorParams(
+                size=dim,
+                distance=Distance.COSINE,
+            ),
+        )
+        log.info("Recreated Qdrant collection '%s' (dim=%d).", QDRANT_COLLECTION, dim)
+        return
+
+    log.info(
+        "Qdrant collection '%s' OK (dim=%d, theo model/config).",
+        QDRANT_COLLECTION,
+        dim,
+    )
 
 
 # ── Insert ────────────────────────────────────────────────
@@ -104,6 +171,28 @@ def upsert_vectors(
 
     log.info("Upserted %d vectors into '%s'.", len(vectors), QDRANT_COLLECTION)
     return point_ids
+
+
+def upsert_vectors_with_ids(
+    vectors: List[List[float]],
+    payloads: List[Dict],
+    point_ids: List[str],
+    batch_size: int = 100,
+) -> None:
+    """Upsert vào Qdrant với ID cố định (re-embedding / batch cập nhật)."""
+    if len(vectors) != len(payloads) or len(vectors) != len(point_ids):
+        raise ValueError("vectors, payloads, point_ids must have same length")
+    client = _get_client()
+    for start in range(0, len(vectors), batch_size):
+        batch_v = vectors[start : start + batch_size]
+        batch_p = payloads[start : start + batch_size]
+        batch_ids = point_ids[start : start + batch_size]
+        points = [
+            PointStruct(id=pid, vector=vec, payload=payload)
+            for vec, payload, pid in zip(batch_v, batch_p, batch_ids)
+        ]
+        client.upsert(collection_name=QDRANT_COLLECTION, points=points)
+    log.info("Upserted %d vectors (fixed IDs) into '%s'.", len(vectors), QDRANT_COLLECTION)
 
 
 # ── Search ────────────────────────────────────────────────

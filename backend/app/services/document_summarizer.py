@@ -157,14 +157,21 @@ async def list_document_articles(query: str) -> Dict[str, Any]:
     if doc.document_type:
         lines.append(f"Loại: {doc.document_type}")
     if doc.issuer:
-        lines.append(f"Cơ quan ban hành: {doc.issuer}")
+        lines.append(f"Trích yếu: {doc.issuer}")
     lines.append(f"Tổng số điều: {len(rows)}")
     lines.append("")
     lines.append("**Danh sách các điều:**\n")
 
+    def _article_num_display(raw: str) -> str:
+        s = (raw or "").strip()
+        s = re.sub(r"(?i)^điều\s*", "", s).strip()
+        return s
+
     for art_num, art_title in rows:
-        num = art_num or ""
-        title = art_title or ""
+        num = _article_num_display(art_num or "")
+        title = (art_title or "").strip()
+        if re.match(r"(?i)^điều\s*\d", title):
+            title = re.sub(r"(?i)^điều\s*\d+[a-z]?\s*[.:–-]\s*", "", title).strip()
         if num and title:
             lines.append(f"- **Điều {num}.** {title}")
         elif num:

@@ -7,7 +7,7 @@ import {
   ChevronRight,
   Settings,
 } from "lucide-react";
-import { getDatasets, deleteDataset } from "../api/client";
+import { getDatasets, deleteDataset, getIntentIndexStats } from "../api/client";
 import UploadModal from "./UploadModal";
 import TemperatureSlider from "./TemperatureSlider";
 import GpuBadge from "./GpuBadge";
@@ -22,6 +22,7 @@ export default function Sidebar({
   const [datasets, setDatasets] = useState([]);
   const [showUpload, setShowUpload] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
+  const [intentStats, setIntentStats] = useState(null);
 
   const refreshDatasets = async () => {
     try {
@@ -42,6 +43,9 @@ export default function Sidebar({
         onSelectDataset(list[0].dataset_id);
       }
     });
+    getIntentIndexStats()
+      .then(setIntentStats)
+      .catch(() => setIntentStats(null));
   }, []);
 
   const handleDelete = async (id) => {
@@ -143,6 +147,12 @@ export default function Sidebar({
             Cài đặt
           </div>
           <TemperatureSlider value={temperature} onChange={onTemperatureChange} />
+          {intentStats && (
+            <p className="text-[10px] text-gray-600 leading-relaxed">
+              Intent index: {intentStats.total_prototypes ?? 0} prototypes,{" "}
+              {intentStats.intents_covered ?? 0}/23 intents
+            </p>
+          )}
           <GpuBadge />
         </div>
       </aside>

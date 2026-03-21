@@ -71,6 +71,20 @@ _ISSUER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Giá trị placeholder từ Swagger / form (giống document_router_v2)
+_METADATA_PLACEHOLDERS = frozenset(
+    {"", "string", "null", "none", "undefined", "n/a", "na", "-"}
+)
+
+
+def _clean_metadata_field(value: Optional[str]) -> str:
+    if value is None:
+        return ""
+    s = value.strip()
+    if not s or s.lower() in _METADATA_PLACEHOLDERS:
+        return ""
+    return s
+
 _DOCTYPES_FROM_CODE = {
     "QH": "Luật",
     "NQ": "Nghị quyết",
@@ -79,6 +93,8 @@ _DOCTYPES_FROM_CODE = {
     "TT": "Thông tư",
     "QD": "Quyết định",
     "QĐ": "Quyết định",
+    "CT": "Chỉ thị",
+    "PL": "Pháp lệnh",
 }
 
 _ISSUED_DATE_PATTERN = re.compile(
@@ -143,7 +159,16 @@ def extract_all_doc_numbers(text: str) -> list[str]:
     return result
 
 
-def _extract_document_type(filename: str, text: str, detected_type: str) -> str:
+def _extract_document_type(filename: str, text: str, detected_type: str, doc_number: str = "") -> str:
+    # Ưu tiên code trong số hiệu vì ổn định hơn tìm theo từ khóa toàn văn.
+    num = (doc_number or "").upper()
+    if "/" in num:
+        tail = num.split("/")[-1]
+        code_part = re.split(r"[-\s]", tail)[0]
+        for code, doc_type in _DOCTYPES_FROM_CODE.items():
+            if code_part.startswith(code):
+                return doc_type
+
     stem = Path(filename).stem.upper()
     parts = stem.split("_")
     if len(parts) >= 3:
@@ -152,7 +177,25 @@ def _extract_document_type(filename: str, text: str, detected_type: str) -> str:
             if code in code_part:
                 return doc_type
 
+    first_lines = [ln.strip().upper() for ln in text.splitlines()[:60] if ln.strip()]
+    for line in first_lines:
+        compact = re.sub(r"[\s\-–—]+", " ", line).strip()
+        if compact == "CHI THI" or compact == "CHỈ THỊ":
+            return "Chỉ thị"
+        if compact == "THONG TU" or compact == "THÔNG TƯ":
+            return "Thông tư"
+        if compact == "NGHI DINH" or compact == "NGHỊ ĐỊNH":
+            return "Nghị định"
+        if compact == "NGHI QUYET" or compact == "NGHỊ QUYẾT":
+            return "Nghị quyết"
+        if compact == "QUYET DINH" or compact == "QUYẾT ĐỊNH":
+            return "Quyết định"
+        if compact == "LUAT" or compact == "LUẬT":
+            return "Luật"
+
     first_1500 = text[:1500].upper()
+    if " CHỈ THỊ" in f" {first_1500}":
+        return "Chỉ thị"
     if "NGHỊ ĐỊNH" in first_1500:
         return "Nghị định"
     if "THÔNG TƯ" in first_1500:
@@ -161,20 +204,125 @@ def _extract_document_type(filename: str, text: str, detected_type: str) -> str:
         return "Nghị quyết"
     if "QUYẾT ĐỊNH" in first_1500:
         return "Quyết định"
-    if "LUẬT" in first_1500:
+    if " LUẬT" in f" {first_1500}":
         return "Luật"
     return detected_type or "Văn bản"
 
 
-def _extract_issuer(text: str) -> str:
-    """Extract issuing authority from document header."""
-    lines = [line.strip() for line in text.splitlines()[:40] if line.strip()]
+def _is_header_noise_line(line: str) -> bool:
+    """Dòng header không phải trích yếu (số văn bản, quốc hiệu, địa điểm–ngày…)."""
+    part = line.split("|")[0].strip()
+    if not part:
+        return True
+    u = part.upper()
+    if u.startswith("SỐ") or u.startswith("SỐ:") or u.startswith("SO:"):
+        return True
+    if "CỘNG HÒA" in u:
+        return True
+    if "ĐỘC LẬP" in u and "TỰ DO" in u:
+        return True
+    if "ỦY BAN NHÂN DÂN" in u and "VỀ VIỆC" not in u:
+        return True
+    if _ISSUER_PATTERN.search(part) and "VỀ VIỆC" not in part.upper():
+        return True
+    if _ISSUED_DATE_PATTERN.search(part) and len(part) < 120:
+        return True
+    if u in ("CHỈ THỊ", "LUẬT", "NGHỊ ĐỊNH", "THÔNG TƯ", "NGHỊ QUYẾT", "QUYẾT ĐỊNH"):
+        return True
+    return False
+
+
+def _line_equals_doc_type_label(line: str, doc_type: str) -> bool:
+    if not doc_type:
+        return False
+    left = re.sub(r"\s+", " ", line.split("|")[0].strip()).upper()
+    dt = re.sub(r"\s+", " ", doc_type.strip()).upper()
+    return left == dt
+
+
+def _looks_like_clause_or_article_line(line: str) -> bool:
+    """Tránh nhầm '1. Phạt tiền...' (khoản Điều 1) với trích yếu."""
+    s = line.split("|")[0].strip()
+    if re.match(r"^\d{1,3}[\.\)]\s+\S", s):
+        return True
+    if re.match(r"(?i)^điều\s+\d+", s):
+        return True
+    if re.match(r"(?i)^chương\s+[ivxlcdm\d]+", s):
+        return True
+    return False
+
+
+def _extract_trich_yeu(text: str, doc_type: str) -> str:
+    """Trích yếu: 'VỀ VIỆC …', 'V/v …', hoặc dòng chủ đề ngay dưới nhãn loại văn bản (LUẬT …)."""
+    lines = [ln.strip() for ln in text.splitlines()[:120] if ln.strip()]
+
     for line in lines:
-        if len(line) > 255:
+        core = line.split("|")[0].strip()
+        if not core or _is_header_noise_line(core):
             continue
-        if _ISSUER_PATTERN.search(line):
-            return line[:255]
+        if re.match(r"(?i)^v[v／/]\s*\.\s*", core) or re.match(r"(?i)^v/v\b", core):
+            return core
+        if re.match(r"(?i)^về\s+việc\b", core):
+            return core
+
+    for idx, line in enumerate(lines):
+        core = line.split("|")[0].strip()
+        if _line_equals_doc_type_label(core, doc_type):
+            j = idx + 1
+            while j < len(lines):
+                nxt = lines[j].split("|")[0].strip()
+                j += 1
+                if not nxt or _is_header_noise_line(nxt):
+                    continue
+                if _looks_like_clause_or_article_line(nxt):
+                    continue
+                if len(nxt) >= 2:
+                    return nxt
+            break
+
+    for line in lines:
+        core = line.split("|")[0].strip()
+        u = core.upper()
+        if "VỀ VIỆC" in u and len(core) >= 12:
+            return core
+
     return ""
+
+
+def _compact_doc_number_for_title(doc_number: str) -> str:
+    """06/CT-UBND -> 06CT-UBND; 09/2017/QH14 -> 092017QH14."""
+    if not doc_number:
+        return ""
+    s = re.sub(r"\s+", "", doc_number.strip())
+    return s.replace("/", "")
+
+
+def _subject_tail_for_title(subject: str) -> str:
+    """Bỏ tiền tố V/v, Về việc; đưa về chữ thường cho phần cuối title."""
+    s = subject.strip()
+    s = re.sub(r"(?i)^v[v／/]\s*\.\s*", "", s)
+    s = re.sub(r"(?i)^v/v\s+", "", s)
+    s = re.sub(r"(?i)^về\s+việc\s+", "", s)
+    return s.strip().lower()
+
+
+def _build_canonical_title(
+    doc_type: str,
+    doc_number: str,
+    issued: Optional[date],
+    trich_yeu: str,
+) -> Optional[str]:
+    """VD: 'Chỉ thị 06CT-UBND ngày 22052025 tăng cường ...'."""
+    compact = _compact_doc_number_for_title(doc_number)
+    if not compact or not doc_type:
+        return None
+    parts: list[str] = [doc_type.strip(), compact]
+    if issued:
+        parts.append(f"ngày {issued.day:02d}{issued.month:02d}{issued.year}")
+    tail = _subject_tail_for_title(trich_yeu)
+    if tail:
+        parts.append(tail)
+    return " ".join(parts)
 
 
 # ── Main pipeline ─────────────────────────────────────────
@@ -193,6 +341,11 @@ async def ingest_document(
     """
     file_path = Path(file_path)
     filename = file_path.name
+    issuer = _clean_metadata_field(issuer)
+    if title_override is not None:
+        to = _clean_metadata_field(title_override)
+        title_override = to or None
+
     log.info("▶ [START] Ingesting '%s'...", filename)
 
     # ── Stage 1: Parse DOCX ──────────────────────────────
@@ -212,11 +365,16 @@ async def ingest_document(
 
     # ── Stage 3: Detect legal structure ──────────────────
     structure = build_article_tree(cleaned)
-    doc_type = _extract_document_type(filename, cleaned, structure.document_type)
-    doc_title = title_override or _title_from_filename(filename) or _extract_title(cleaned, doc_type)
-    issuer_value = issuer.strip() or _extract_issuer(cleaned)
+    doc_type = _extract_document_type(filename, cleaned, structure.document_type, doc_number)
     issued_date_value = issued_date or _extract_issued_date(cleaned)
     effective_date_value = effective_date or _extract_effective_date(cleaned)
+    trich_yeu = _extract_trich_yeu(cleaned, doc_type)
+    issuer_value = issuer or trich_yeu
+    doc_title = title_override
+    if not doc_title:
+        doc_title = _build_canonical_title(doc_type, doc_number, issued_date_value, trich_yeu)
+    if not doc_title:
+        doc_title = _title_from_filename(filename) or _extract_title(cleaned, doc_type)
 
     legal_domain = classify_document_domain(doc_title, cleaned[:1000])
     total_clauses_in_tree = sum(len(a.clauses) for a in structure.articles) if structure.articles else 0

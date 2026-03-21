@@ -17,6 +17,7 @@ from app.retrieval.article_lookup import lookup_article_from_db
 from app.retrieval.keyword_retriever import keyword_search
 from app.retrieval.reranker import rerank
 from app.retrieval.vector_retriever import vector_search
+from app.retrieval.article_selection import diversify_by_article, dynamic_max_articles
 
 log = logging.getLogger(__name__)
 
@@ -382,6 +383,26 @@ _GENERAL_QUERY_RE = re.compile(
     re.IGNORECASE,
 )
 
+_MULTI_ARTICLE_QUERY_RE = re.compile(
+    r"(?:"
+    r"\bngành,?\s*nghề\s+đầu\s+tư\s+kinh\s+doanh\s+có\s+điều\s+kiện\b"
+    r"|\bdanh\s*mục\b"
+    r"|\bliệt\s*kê\b"
+    r"|\bbao\s*gồm\b"
+    r"|\bcác\s+điều\b"
+    r"|\bnhững\s+điều\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _query_prefers_multi_article(query: str) -> bool:
+    return bool(_MULTI_ARTICLE_QUERY_RE.search(query or ""))
+
+
+def _unique_article_count(items: List[Dict]) -> int:
+    return len({i.get("article_id") for i in items if i.get("article_id")})
+
 
 async def _direct_article_lookup(
     db: AsyncSession,
@@ -449,6 +470,7 @@ async def hybrid_search(
     single_article_only: bool = True,
     legal_domains: Optional[List[str]] = None,
     max_articles: Optional[int] = None,
+    doc_number_source_query: Optional[str] = None,
 ) -> List[Dict]:
     """Run article-aware hybrid retrieval and return context-ready chunks.
 
@@ -456,17 +478,33 @@ async def hybrid_search(
         legal_domains: Pre-classified domain tags to filter Qdrant vectors.
         max_articles: When single_article_only=True, keep top N articles (default from config).
                       1 = one article only; 3–5 = multi-article context for comparison.
+        doc_number_source_query: If set, số hiệu văn bản (DB Mode 2 + resolve path) lấy từ
+            chuỗi này thay vì từ ``query`` (dùng khi ``query`` là biến thể từ expand_query).
     """
     final_k = top_k or RERANK_TOP_K
     fetch_k = retrieval_k or RETRIEVAL_TOP_K
     explicit_article = _extract_article_reference(query)
-    explicit_doc_ref = _extract_doc_reference(query)
+    ref_source = (
+        doc_number_source_query if doc_number_source_query is not None else query
+    )
+    explicit_doc_ref = _extract_doc_reference(ref_source)
 
     # ── 0. Direct DB lookup for specific article/clause queries ──
-    db_lookup_results = await lookup_article_from_db(db, query)
+    db_lookup_results = await lookup_article_from_db(
+        db, query, doc_number_source_query=doc_number_source_query
+    )
+    prefer_multi = _query_prefers_multi_article(query)
     if db_lookup_results:
-        log.info("[HYBRID] DB article lookup returned %d passages — skipping vector search", len(db_lookup_results))
-        return db_lookup_results
+        db_article_count = _unique_article_count(db_lookup_results)
+        if prefer_multi and db_article_count < 2 and not explicit_article:
+            log.info(
+                "[HYBRID] DB lookup returned %d passages (%d article) for multi-article query; continuing hybrid merge",
+                len(db_lookup_results),
+                db_article_count,
+            )
+        else:
+            log.info("[HYBRID] DB article lookup returned %d passages — skipping vector search", len(db_lookup_results))
+            return db_lookup_results
 
     # ── 0b. Resolve doc_number against DB (handles NĐ↔ND mismatch) ──
     raw_doc_ref = doc_number or explicit_doc_ref
@@ -481,8 +519,16 @@ async def hybrid_search(
             db, resolved_doc_number, query, explicit_article,
         )
         if direct_results:
-            log.info("[HYBRID] Direct article lookup returned %d chunks", len(direct_results))
-            return direct_results
+            direct_article_count = _unique_article_count(direct_results)
+            if prefer_multi and direct_article_count < 2 and not explicit_article:
+                log.info(
+                    "[HYBRID] Direct lookup returned %d chunks (%d article) for multi-article query; continuing hybrid merge",
+                    len(direct_results),
+                    direct_article_count,
+                )
+            else:
+                log.info("[HYBRID] Direct article lookup returned %d chunks", len(direct_results))
+                return direct_results
 
     # ── 1. Vector search (with domain pre-filter) ────────
     vector_results = vector_search(
@@ -539,11 +585,22 @@ async def hybrid_search(
             )
             reranked = []
 
+    # ── 4c. V3: đa dạng hóa theo document + quyết định số article động (sau rerank)
+    if reranked:
+        reranked = diversify_by_article(reranked, min_docs=3)
+        dyn_article_cap = dynamic_max_articles(reranked)
+    else:
+        dyn_article_cap = 1
+
     # ── 5. Article selection mode ───────────────────────────
+    # Winner-takes-all tĩnh đã thay bằng diversify + dynamic_max_articles (n_keep).
     if not single_article_only:
         reranked = reranked[:final_k]
     else:
-        n_keep = max_articles if max_articles is not None else 1
+        n_keep = dyn_article_cap
+        if max_articles is not None:
+            n_keep = min(n_keep, max_articles)
+        n_keep = max(1, min(n_keep, MULTI_ARTICLE_MAX_ARTICLES))
         group_scores = _score_and_group_articles(query, reranked, explicit_article, explicit_doc_ref)
         if n_keep > 1:
             top_groups = _select_top_n_articles(group_scores, n_keep)

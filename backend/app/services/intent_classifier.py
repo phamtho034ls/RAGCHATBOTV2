@@ -1,7 +1,6 @@
-"""Intent classifier – tự nhận diện loại câu hỏi bằng embedding + ngân hàng câu ví dụ.
+"""DEPRECATED (v3): RAG intent flags dùng `intent_detector.get_rag_intents()` + `map_intent_to_rag_flags`.
 
-Thay vì chỉ dựa vào regex (INDICATORS), so khớp câu hỏi với các câu ví dụ theo từng intent,
-dùng embedding tương tự domain_classifier. Có thể bật/tắt qua USE_INTENT_CLASSIFIER.
+Module này giữ lại để tham khảo; `rag_chain_v2` và `main` không còn import/warmup.
 """
 
 from __future__ import annotations

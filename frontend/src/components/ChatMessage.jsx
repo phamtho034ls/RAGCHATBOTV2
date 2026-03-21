@@ -16,7 +16,7 @@ function splitCitations(text) {
   };
 }
 
-export default function ChatMessage({ role, content }) {
+export default function ChatMessage({ role, content, confidence, retried }) {
   const isUser = role === "user";
   const { body, citations } = isUser ? { body: content, citations: null } : splitCitations(content);
 
@@ -46,6 +46,12 @@ export default function ChatMessage({ role, content }) {
               <div className="mt-3 pt-2 border-t border-surface-border text-xs text-gray-500">
                 <ReactMarkdown>{citations}</ReactMarkdown>
               </div>
+            )}
+            {typeof confidence === "number" && (
+              <p className="mt-2 text-[10px] text-gray-500">
+                Độ tin cậy ước lượng: {(confidence * 100).toFixed(0)}%
+                {retried ? " • đã thử lại với nhiều nguồn" : ""}
+              </p>
             )}
           </>
         )}

@@ -18,7 +18,6 @@ from app.pipeline.vector_store import ensure_collection
 from app.pipeline.embedding import warmup as warmup_embeddings
 from app.retrieval.reranker import warmup as warmup_reranker
 from app.services.intent_detector import warmup_intent_index
-from app.services.intent_classifier import warmup_intent_index as warmup_rag_intent_index
 from app.services.domain_classifier import warmup_domain_index
 
 # ── v2 Routers ────────────────────────────────────────────
@@ -50,27 +49,23 @@ async def lifespan(app: FastAPI):
     await init_postgres()
     log.info("PostgreSQL initialized.")
 
-    # 2. Qdrant collection
-    ensure_collection()
-    log.info("Qdrant collection ensured.")
-
-    # 3. Embedding model warm-up
+    # 2. Embedding model warm-up (trước Qdrant để tạo collection đúng chiều vector)
     warmup_embeddings()
     log.info("Embedding model ready.")
+
+    # 3. Qdrant collection
+    ensure_collection()
+    log.info("Qdrant collection ensured.")
 
     # 4. Reranker model warm-up
     warmup_reranker()
     log.info("Reranker model ready.")
 
-    # 5. Intent prototype semantic index
+    # 5. Intent prototype semantic index (dùng cho detect_intent + get_rag_intents)
     warmup_intent_index()
     log.info("Intent semantic index ready.")
 
-    # 6. RAG intent classifier (scenario / multi-article / expansion)
-    warmup_rag_intent_index()
-    log.info("RAG intent classifier index ready.")
-
-    # 7. Legal domain classification index
+    # 6. Legal domain classification index
     warmup_domain_index()
     log.info("Legal domain index ready.")
 

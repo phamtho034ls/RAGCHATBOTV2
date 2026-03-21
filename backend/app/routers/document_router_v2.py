@@ -18,7 +18,7 @@ from datetime import date
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy import func, select, delete as sa_delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,14 +34,44 @@ from app.models.schemas_v2 import (
 from app.pipeline.ingestor import ingest_document
 from app.pipeline.vector_store import delete_by_document_id
 from app.services.intent_detector import auto_index_from_document
+from app.cache.redis_cache import invalidate_all_query_cache
 
 log = logging.getLogger(__name__)
+
+
+async def _invalidate_cache_after_upload(document_id: int) -> None:
+    try:
+        n = await invalidate_all_query_cache()
+        log.info("Cache invalidated after document upload: doc_id=%s (%d keys)", document_id, n)
+    except Exception as exc:
+        log.error("Cache invalidation failed after upload doc_id=%s: %s", document_id, exc)
 router = APIRouter(prefix="/api", tags=["documents"])
 
 ALLOWED_EXTENSIONS = (".doc", ".docx")
 
 
 _MAX_FILENAME_LEN = 150  # Windows MAX_PATH = 260; reserve ~110 for dir prefix
+
+
+# Swagger UI often pre-fills optional form fields with the literal "string".
+_DATE_FORM_IGNORE = frozenset(
+    {"", "string", "null", "none", "undefined", "n/a", "na", "-"}
+)
+
+
+def _parse_optional_date_form(value: Optional[str], field: str) -> Optional[date]:
+    """Parse YYYY-MM-DD from multipart form; empty / Swagger placeholders → None."""
+    if value is None:
+        return None
+    s = value.strip()
+    if not s or s.lower() in _DATE_FORM_IGNORE:
+        return None
+    try:
+        return date.fromisoformat(s[:10])
+    except ValueError as e:
+        msg = f"{field} không hợp lệ (dùng YYYY-MM-DD): {s!r}"
+        log.warning("POST /api/upload → 400 | %s", msg)
+        raise HTTPException(400, msg) from e
 
 
 def _safe_filename(raw_filename: str) -> str:
@@ -66,16 +96,23 @@ def _safe_filename(raw_filename: str) -> str:
 
 @router.post("/upload", response_model=UploadResponse)
 async def upload_document(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     issuer: str = Form(default=""),
-    issued_date: Optional[date] = Form(default=None),
-    effective_date: Optional[date] = Form(default=None),
+    issued_date: Optional[str] = Form(default=None),
+    effective_date: Optional[str] = Form(default=None),
     title: Optional[str] = Form(default=None),
     db: AsyncSession = Depends(get_db),
 ):
     """Upload and ingest a legal DOCX document."""
+    issued_parsed = _parse_optional_date_form(issued_date, "issued_date")
+    effective_parsed = _parse_optional_date_form(effective_date, "effective_date")
     safe_name = _safe_filename(file.filename or "")
     if not safe_name.lower().endswith(ALLOWED_EXTENSIONS):
+        log.warning(
+            "POST /api/upload → 400 | Chỉ hỗ trợ .doc/.docx | filename=%r",
+            file.filename,
+        )
         raise HTTPException(400, "Chỉ hỗ trợ file .doc và .docx")
 
     upload_id = uuid.uuid4().hex[:12]
@@ -92,8 +129,8 @@ async def upload_document(
             file_path=file_path,
             db=db,
             issuer=issuer,
-            issued_date=issued_date,
-            effective_date=effective_date,
+            issued_date=issued_parsed,
+            effective_date=effective_parsed,
             title_override=title,
         )
         doc_id = result.get("document_id")
@@ -104,12 +141,17 @@ async def upload_document(
                     log.info("Auto-indexed %d prototypes from doc_id=%s", added, doc_id)
             except Exception as e_idx:
                 log.warning("Auto-index failed for doc_id=%s: %s", doc_id, e_idx)
+            background_tasks.add_task(_invalidate_cache_after_upload, int(doc_id))
         return UploadResponse(**result)
     except ValueError as e:
-        # Clean up file and return user-facing validation error.
+        # Clean up file — document không đúng định dạng văn bản pháp luật (Điều/Khoản).
         shutil.rmtree(upload_dir, ignore_errors=True)
-        log.warning("Ingestion rejected for '%s': %s", file.filename, e)
-        raise HTTPException(422, str(e))
+        log.warning(
+            "POST /api/upload → 400 | file=%r | %s",
+            file.filename,
+            e,
+        )
+        raise HTTPException(400, str(e))
     except Exception as e:
         # Clean up on failure
         shutil.rmtree(upload_dir, ignore_errors=True)
@@ -119,6 +161,7 @@ async def upload_document(
 
 @router.post("/upload-folder")
 async def upload_folder(
+    background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
     issuer: str = Form(default=""),
     db: AsyncSession = Depends(get_db),
@@ -195,6 +238,10 @@ async def upload_folder(
                 }
             )
             success_count += 1
+            if ingest_result.get("document_id"):
+                background_tasks.add_task(
+                    _invalidate_cache_after_upload, int(ingest_result["document_id"])
+                )
             log.info(
                 "  [%d/%d] OK '%s' → doc_id=%s, chunks=%d",
                 idx, total_files, safe_name,

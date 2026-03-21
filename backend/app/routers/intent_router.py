@@ -10,9 +10,15 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 
 from app.models.schemas import IntentRequest, IntentResponse
-from app.services.intent_detector import detect_intent
+from app.services.intent_detector import detect_intent, get_index_stats
 
 router = APIRouter(tags=["intent"])
+
+
+@router.get("/api/intent/index-stats")
+async def intent_index_stats():
+    """Thống kê prototype / intent coverage cho evaluation & UI."""
+    return get_index_stats()
 
 
 @router.post("/api/intent", response_model=IntentResponse)

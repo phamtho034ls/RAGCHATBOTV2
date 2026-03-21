@@ -45,11 +45,36 @@ async def _check_postgres() -> bool:
         return False
 
 
+def _qdrant_status_ok(raw: object) -> bool:
+    """Treat green/yellow as usable; grey/red or unknown as not ready."""
+    if raw is None:
+        return False
+    if isinstance(raw, str):
+        s = raw.lower().strip()
+    else:
+        s = str(getattr(raw, "value", raw)).lower().strip()
+    return s in ("green", "yellow")
+
+
 def _check_qdrant() -> bool:
     try:
-        from app.pipeline.vector_store import get_collection_info
-        info = get_collection_info()
-        return info.get("status") == "green"
+        from app.pipeline.vector_store import _get_client
+        from app.config import QDRANT_COLLECTION
+
+        client = _get_client()
+        # Server reachable?
+        client.get_collections()
+        info = client.get_collection(collection_name=QDRANT_COLLECTION)
+        raw_status = getattr(info, "status", None)
+        ok = _qdrant_status_ok(raw_status)
+        if not ok:
+            st = getattr(raw_status, "value", raw_status) if raw_status is not None else "unknown"
+            log.warning(
+                "Qdrant collection '%s' not ready (status=%s)",
+                QDRANT_COLLECTION,
+                st,
+            )
+        return ok
     except Exception as e:
         log.warning("Qdrant health check failed: %s", e)
         return False

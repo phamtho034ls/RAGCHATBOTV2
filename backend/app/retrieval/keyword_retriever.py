@@ -19,22 +19,102 @@ from app.database.models import Article, Clause, VectorChunk, Document
 log = logging.getLogger(__name__)
 
 
+async def full_text_search(
+    query: str,
+    db: AsyncSession,
+    limit: int = 20,
+    doc_number: Optional[str] = None,
+) -> List[Dict]:
+    """Full-text search trên bảng ``articles`` (tsvector + unaccent).
+
+    Trả về dict cùng format ``keyword_search`` / ``vector_search`` (text_chunk, scores...).
+    Nếu cột ``search_vector`` chưa có (chưa migration) → [].
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    stmt = text(
+        """
+        SELECT
+          a.id AS article_id,
+          a.document_id,
+          a.article_number,
+          a.title AS article_title,
+          LEFT(a.content, 6000) AS chunk_text,
+          d.doc_number,
+          d.title AS document_title,
+          ts_rank_cd(
+            a.search_vector,
+            plainto_tsquery('simple', public.unaccent(:q))
+          ) AS fts_rank
+        FROM articles a
+        JOIN documents d ON d.id = a.document_id
+        WHERE a.search_vector @@ plainto_tsquery('simple', public.unaccent(:q))
+          AND (
+            :doc_number IS NULL
+            OR UPPER(TRIM(d.doc_number)) = UPPER(TRIM(:doc_number))
+          )
+        ORDER BY fts_rank DESC
+        LIMIT :lim
+        """
+    )
+    try:
+        # SAVEPOINT: FTS lỗi → chỉ rollback savepoint, ILIKE fallback vẫn chạy được.
+        async with db.begin_nested():
+            res = await db.execute(
+                stmt,
+                {"q": q, "lim": limit, "doc_number": doc_number},
+            )
+            rows = res.mappings().all()
+    except Exception as exc:
+        log.warning(
+            "full_text_search skipped (FTS/error — dùng ILIKE): %s",
+            exc,
+        )
+        return []
+
+    out: List[Dict] = []
+    for row in rows:
+        rank = float(row["fts_rank"] or 0.0)
+        out.append(
+            {
+                "id": f"fts-article-{row['article_id']}",
+                "score": rank,
+                "text_chunk": row["chunk_text"] or "",
+                "document_id": row["document_id"],
+                "article_id": row["article_id"],
+                "clause_id": None,
+                "doc_number": row["doc_number"],
+                "document_title": row["document_title"] or "",
+                "article_number": _normalize_article_number(row["article_number"]),
+                "article_title": row["article_title"] or "",
+                "clause_number": None,
+            }
+        )
+    return out
+
+
 async def keyword_search(
     query: str,
     db: AsyncSession,
     top_k: int = 20,
     doc_number: Optional[str] = None,
 ) -> List[Dict]:
-    """Run BM25-style keyword search over vector_chunks in PostgreSQL.
-
-    Uses ILIKE with scored keyword overlap for ranking.
-    Returns list of dicts matching the vector_search output format.
-    """
+    """Keyword search: ưu tiên FTS ``articles`` (unaccent + tsvector), fallback ILIKE trên chunks."""
     keywords = _extract_keywords(query)
+    if not keywords and not (query or "").strip():
+        return []
+
+    fts_hits = await full_text_search(query, db, limit=top_k * 2, doc_number=doc_number)
+    if fts_hits:
+        log.debug("Keyword path: FTS articles returned %d hits", len(fts_hits))
+        return fts_hits[:top_k]
+
     if not keywords:
         return []
 
-    # Build query: search chunks that contain any keyword, rank by match count
+    # Fallback: ILIKE trên vector_chunks
     stmt = (
         select(
             VectorChunk.id,

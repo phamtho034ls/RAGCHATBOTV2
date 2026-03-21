@@ -1,19 +1,20 @@
-"""Reranker – cross-encoder scoring for passage relevance.
+"""Reranker – cross-encoder / FlagReranker scoring for passage relevance.
 
-Uses BAAI/bge-reranker-base (or configurable model) to rerank
-candidate passages against the user query.
+Ưu tiên BAAI/bge-reranker-v2-m3 qua FlagEmbedding (đa ngôn ngữ, tiếng Việt tốt hơn).
+Fallback: CrossEncoder với BAAI/bge-reranker-base nếu không tải được model mới.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union
 
-from app.config import RERANKER_DEVICE, RERANKER_MODEL
+from app.config import RERANKER_BATCH_SIZE, RERANKER_DEVICE, RERANKER_FALLBACK_MODEL, RERANKER_MODEL
 
 log = logging.getLogger(__name__)
 
-_reranker = None
+_reranker: Union[object, None] = None
+_reranker_backend: str = ""
 
 
 def warmup():
@@ -22,13 +23,31 @@ def warmup():
 
 
 def _get_reranker():
-    """Lazy-load the cross-encoder reranker model."""
-    global _reranker
+    """Lazy-load reranker: FlagReranker (v2-m3) hoặc CrossEncoder (fallback)."""
+    global _reranker, _reranker_backend
     if _reranker is None:
-        from sentence_transformers import CrossEncoder
+        try:
+            from FlagEmbedding import FlagReranker
 
-        _reranker = CrossEncoder(RERANKER_MODEL, device=RERANKER_DEVICE)
-        log.info("Loaded reranker '%s' on %s.", RERANKER_MODEL, RERANKER_DEVICE)
+            _reranker = FlagReranker(RERANKER_MODEL, use_fp16=False, device=RERANKER_DEVICE)
+            _reranker_backend = f"FlagReranker:{RERANKER_MODEL}"
+            log.info(
+                "Loaded reranker '%s' via FlagEmbedding on %s (multilingual; tốt cho tiếng Việt).",
+                RERANKER_MODEL,
+                RERANKER_DEVICE,
+            )
+        except Exception as exc:
+            log.warning(
+                "FlagReranker load failed for '%s' (%s); falling back to CrossEncoder '%s'.",
+                RERANKER_MODEL,
+                exc,
+                RERANKER_FALLBACK_MODEL,
+            )
+            from sentence_transformers import CrossEncoder
+
+            _reranker = CrossEncoder(RERANKER_FALLBACK_MODEL, device=RERANKER_DEVICE)
+            _reranker_backend = f"CrossEncoder:{RERANKER_FALLBACK_MODEL}"
+            log.info("Loaded fallback reranker '%s' on %s.", RERANKER_FALLBACK_MODEL, RERANKER_DEVICE)
     return _reranker
 
 
@@ -38,37 +57,28 @@ def rerank(
     top_k: int = 5,
     text_key: str = "text_chunk",
 ) -> List[Dict]:
-    """Rerank candidate passages using a cross-encoder model.
-
-    Args:
-        query: The user's question.
-        candidates: List of dicts, each must have ``text_key`` field.
-        top_k: Number of top results to return after reranking.
-        text_key: Key in each candidate dict that holds the passage text.
-
-    Returns:
-        Top-K candidates sorted by reranker score (highest first).
-        Each dict gets an added ``rerank_score`` field.
-    """
+    """Rerank candidate passages. Each dict gets ``rerank_score`` field."""
     if not candidates:
         return []
 
     model = _get_reranker()
-
-    # Build (query, passage) pairs
     pairs: List[Tuple[str, str]] = []
     for c in candidates:
         passage = c.get(text_key, "")
         pairs.append((query, passage))
 
-    # Score all pairs
-    scores = model.predict(pairs, show_progress_bar=False)
+    if _reranker_backend.startswith("FlagReranker"):
+        try:
+            scores = model.compute_score(pairs, batch_size=RERANKER_BATCH_SIZE)
+        except TypeError:
+            scores = model.compute_score(pairs)
+        if not isinstance(scores, list):
+            scores = list(scores)
+    else:
+        scores = model.predict(pairs, show_progress_bar=False, batch_size=RERANKER_BATCH_SIZE)
 
-    # Attach scores
     for c, score in zip(candidates, scores):
         c["rerank_score"] = float(score)
 
-    # Sort by rerank_score descending
     candidates.sort(key=lambda x: x["rerank_score"], reverse=True)
-
     return candidates[:top_k]

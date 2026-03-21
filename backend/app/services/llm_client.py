@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator, List, Optional
 
 from openai import AsyncOpenAI
 
@@ -89,6 +89,34 @@ async def generate(
         return resp.choices[0].message.content or ""
     except Exception as exc:
         log.error("OpenAI generate failed: %s", exc)
+        raise
+
+
+async def generate_with_messages(
+    messages: List[dict[str, Any]],
+    temperature: float = 0.5,
+    model: Optional[str] = None,
+) -> str:
+    """Chat completion với mảng messages (system + lịch sử + user)."""
+    client = _get_client()
+    safe: List[dict] = []
+    for m in messages:
+        role = m.get("role", "user")
+        content = _sanitize_text(str(m.get("content", "")))
+        if content:
+            safe.append({"role": role, "content": content})
+    if not safe:
+        return ""
+    try:
+        resp = await client.chat.completions.create(
+            model=model or OPENAI_MODEL,
+            messages=safe,
+            temperature=temperature,
+            max_tokens=MAX_TOKENS,
+        )
+        return resp.choices[0].message.content or ""
+    except Exception as exc:
+        log.error("OpenAI generate_with_messages failed: %s", exc)
         raise
 
 

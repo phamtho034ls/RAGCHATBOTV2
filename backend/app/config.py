@@ -31,13 +31,18 @@ QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "law_documents")
+# Khi collection Qdrant đã tồn tại nhưng size vector ≠ model (vd. 384 → 768): xóa và tạo lại collection.
+# Tắt (false) nếu production — khi đó cần migrate Qdrant thủ công.
+QDRANT_RECREATE_ON_DIM_MISMATCH = os.getenv(
+    "QDRANT_RECREATE_ON_DIM_MISMATCH", "true"
+).lower() in ("1", "true", "yes", "on")
 
 # ── Redis ──────────────────────────────────────────────────
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 REDIS_CACHE_TTL = int(os.getenv("REDIS_CACHE_TTL", "3600"))  # 1 hour
 
 # ── Embedding dimension (must match the embedding model output) ──
-EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "384"))
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "768"))
 
 # ── OpenAI ─────────────────────────────────────────────────
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -51,10 +56,15 @@ MAX_TOKENS = int(os.getenv("MAX_TOKENS", "4096"))
 # ── Embedding ──────────────────────────────────────────────
 EMBEDDING_MODEL = os.getenv(
     "EMBEDDING_MODEL",
+    "keepitreal/vietnamese-sbert",
+)
+EMBEDDING_FALLBACK_MODEL = os.getenv(
+    "EMBEDDING_FALLBACK_MODEL",
     "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
 )
 EMBEDDING_DEVICE = os.getenv("EMBEDDING_DEVICE", "cuda")  # cuda | cpu
 EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "32"))
+EMBEDDING_MAX_LENGTH = int(os.getenv("EMBEDDING_MAX_LENGTH", "512"))
 
 # ── HuggingFace Token (tránh warning rate-limit) ──────────
 HF_TOKEN = os.getenv("HF_TOKEN", None)
@@ -73,10 +83,15 @@ FAISS_SEARCH_K = int(os.getenv("FAISS_SEARCH_K", "50"))
 BM25_SEARCH_K = int(os.getenv("BM25_SEARCH_K", "50"))
 RERANKER_MODEL = os.getenv(
     "RERANKER_MODEL",
+    "BAAI/bge-reranker-v2-m3",
+)
+RERANKER_FALLBACK_MODEL = os.getenv(
+    "RERANKER_FALLBACK_MODEL",
     "BAAI/bge-reranker-base",
 )
 RERANKER_DEVICE = os.getenv("RERANKER_DEVICE", "cpu")  # cpu tránh tranh GPU với embedding model
-ANSWER_VALIDATION_THRESHOLD = float(os.getenv("ANSWER_VALIDATION_THRESHOLD", "0.20"))
+RERANKER_BATCH_SIZE = int(os.getenv("RERANKER_BATCH_SIZE", "16"))
+ANSWER_VALIDATION_THRESHOLD = float(os.getenv("ANSWER_VALIDATION_THRESHOLD", "0.40"))
 CONTEXT_RELEVANCE_THRESHOLD = float(os.getenv("CONTEXT_RELEVANCE_THRESHOLD", "0.15"))
 NO_INFO_MESSAGE = "Không tìm thấy nội dung phù hợp trong cơ sở dữ liệu pháp luật."
 OUT_OF_DOMAIN_MESSAGE = "Tôi chỉ có thể trả lời dựa trên các tài liệu đã được cung cấp."
@@ -89,6 +104,7 @@ USE_MULTI_ARTICLE_FOR_CONDITIONS = os.getenv("USE_MULTI_ARTICLE_FOR_CONDITIONS",
 
 # ── Intent classifier (tự nhận diện loại câu hỏi thay vì chỉ regex) ─
 # true = dùng embedding + ngân hàng câu ví dụ; false = chỉ dùng regex
+# Đã gộp vào intent_detector.get_rag_intents (v3). Giữ biến env để không lỗi .env cũ — không còn dùng trong code.
 USE_INTENT_CLASSIFIER = os.getenv("USE_INTENT_CLASSIFIER", "true").lower() in ("1", "true", "yes")
 # Ngưỡng tin cậy để chấp nhận intent từ classifier (0.4–0.7 hợp lý)
 INTENT_CONFIDENCE_THRESHOLD = float(os.getenv("INTENT_CONFIDENCE_THRESHOLD", "0.50"))

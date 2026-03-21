@@ -423,8 +423,18 @@ class QueryUnderstanding:
         if gov_level:
             filters["government_level"] = gov_level
 
-        # Trích xuất loại văn bản
+        # Trích xuất loại văn bản (tránh nhầm cụm hành chính / ngữ pháp)
         doc_type = self._match_first(query_lower, self.DOCUMENT_TYPE_MAP)
+        if doc_type == "quyet_dinh" and re.search(
+            r"thẩm quyền\s+quyết định|quyền\s+quyết định|được\s+quyết định",
+            query_lower,
+        ):
+            doc_type = None  # "quyết định" = thẩm quyền/xử lý, không phải văn bản "Quyết định"
+        if doc_type == "luat" and re.search(
+            r"điều\s+luật|các\s+điều\s+luật|theo\s+điều\s+luật",
+            query_lower,
+        ):
+            doc_type = None  # "điều luật" = cụm chỉ điều khoản, không phải loại "Luật"
         if doc_type:
             filters["document_type"] = doc_type
 

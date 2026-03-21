@@ -84,6 +84,7 @@ async def search_all(
                     db=db,
                     top_k=top_k,
                     doc_number=doc_number,
+                    doc_number_source_query=query,
                 )
                 for r in extra:
                     if r.get("id") not in seen_ids:

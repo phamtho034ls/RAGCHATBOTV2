@@ -19,7 +19,7 @@ import re
 import unicodedata
 from typing import Dict, List, Optional
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import desc, func, nulls_last, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import Article, Clause, Document
@@ -175,11 +175,38 @@ def _strip_vn_diacritics(text: str) -> str:
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 
 
+def _doc_number_lookup_variants(doc_num: str) -> List[str]:
+    """Variants for SQL exact/prefix match (NĐ↔ND, QĐ↔QD)."""
+    doc_num = doc_num.strip()
+    if not doc_num:
+        return []
+    out: List[str] = []
+    seen: set[str] = set()
+
+    def add(s: str) -> None:
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+
+    add(doc_num)
+    if "NĐ" in doc_num:
+        add(doc_num.replace("NĐ", "ND"))
+    if "ND" in doc_num and "NĐ" not in doc_num:
+        add(doc_num.replace("ND", "NĐ", 1))
+    if "QĐ" in doc_num:
+        add(doc_num.replace("QĐ", "QD"))
+    if "QD" in doc_num and "QĐ" not in doc_num:
+        add(doc_num.replace("QD", "QĐ", 1))
+    return out
+
+
 # ── DB lookup ─────────────────────────────────────────────
 
 async def lookup_article_from_db(
     db: AsyncSession,
     query: str,
+    *,
+    doc_number_source_query: Optional[str] = None,
 ) -> List[Dict]:
     """Look up article/clause content directly from PostgreSQL.
 
@@ -189,6 +216,10 @@ async def lookup_article_from_db(
          return all articles (summary) or search by topic
       3. Topic-based: "Hành vi bị nghiêm cấm trong Luật Di sản văn hóa"
          → search articles by title/content keywords within the named law
+
+    doc_number_source_query:
+        When set (e.g. original user question in multi-query retrieval), số hiệu văn bản
+        (Mode 2) chỉ trích từ chuỗi này — tránh LLM thêm số hiệu vào biến thể truy vấn.
     """
     # ── Mode 1: Specific article reference ──
     parsed = parse_article_clause_query(query)
@@ -198,7 +229,10 @@ async def lookup_article_from_db(
             return result
 
     # ── Mode 2: Doc-number reference (49/2025/QĐ-UBND, 06/CT-UBND) ──
-    doc_num_ref = _extract_doc_number_ref(query)
+    ref_source = (
+        doc_number_source_query if doc_number_source_query is not None else query
+    )
+    doc_num_ref = _extract_doc_number_ref(ref_source)
     if doc_num_ref:
         result = await _lookup_by_doc_number(db, query, doc_num_ref)
         if result:
@@ -299,54 +333,103 @@ async def _find_document_by_number(
     db: AsyncSession,
     doc_num: str,
 ) -> List[int]:
-    """Find documents by doc_number (exact → contains → diacritics-stripped)."""
-    # 1. Exact match
-    stmt = (
-        select(Document.id, Document.doc_number)
-        .where(Document.doc_number == doc_num)
-        .limit(5)
-    )
-    rows = (await db.execute(stmt)).all()
-    if rows:
-        log.info("[DOC_NUM_LOOKUP] Exact: '%s' → %s", doc_num, [(r.id, r.doc_number) for r in rows])
-        return [r.id for r in rows]
+    """Find documents by doc_number (exact → prefix → scoped fuzzy).
 
-    # 2. Case-insensitive contains
-    stmt = (
-        select(Document.id, Document.doc_number)
-        .where(func.lower(Document.doc_number).contains(doc_num.lower()))
-        .limit(5)
-    )
-    rows = (await db.execute(stmt)).all()
-    if rows:
-        log.info("[DOC_NUM_LOOKUP] Contains: '%s' → %s", doc_num, [(r.id, r.doc_number) for r in rows])
-        return [r.id for r in rows]
+    Avoids SQL ``contains`` on full doc_number (false positives e.g. ``131/2021``
+    matching ``%31/2021%``) and avoids single-digit prefix ``31/%`` when user gave
+    ``num/year/type``.
+    """
+    doc_num = doc_num.strip()
+    if not doc_num:
+        return []
 
-    # 3. Diacritics-stripped comparison (QĐ↔QD, NĐ↔ND)
-    stripped = _strip_vn_diacritics(doc_num).upper()
-    stmt = select(Document.id, Document.doc_number).limit(200)
-    all_rows = (await db.execute(stmt)).all()
-    matches = [
-        r for r in all_rows
-        if stripped in _strip_vn_diacritics(r.doc_number).upper()
-    ]
-    if matches:
-        log.info("[DOC_NUM_LOOKUP] Diacritics: '%s' → %s", doc_num, [(r.id, r.doc_number) for r in matches[:5]])
-        return [r.id for r in matches[:5]]
+    variants = _doc_number_lookup_variants(doc_num)
 
-    # 4. Numeric prefix fallback (e.g. "49" in "49/2025/QĐ-UBND")
-    num_prefix = re.match(r"(\d+)", doc_num)
-    if num_prefix:
-        prefix = num_prefix.group(1)
+    # 1. Exact match (any variant)
+    for v in variants:
         stmt = (
             select(Document.id, Document.doc_number)
-            .where(Document.doc_number.like(f"{prefix}/%"))
-            .limit(10)
+            .where(Document.doc_number == v)
+            .limit(5)
         )
         rows = (await db.execute(stmt)).all()
         if rows:
-            log.info("[DOC_NUM_LOOKUP] Prefix '%s/' → %s", prefix, [(r.id, r.doc_number) for r in rows[:5]])
+            log.info(
+                "[DOC_NUM_LOOKUP] Exact: '%s' → %s",
+                doc_num,
+                [(r.id, r.doc_number) for r in rows],
+            )
             return [r.id for r in rows]
+
+    # 2. Stored value starts with reference (handles trailing file id suffixes)
+    for v in variants:
+        stmt = (
+            select(Document.id, Document.doc_number)
+            .where(Document.doc_number.like(f"{v}%"))
+            .limit(5)
+        )
+        rows = (await db.execute(stmt)).all()
+        if rows:
+            log.info(
+                "[DOC_NUM_LOOKUP] Prefix: '%s' → %s",
+                doc_num,
+                [(r.id, r.doc_number) for r in rows],
+            )
+            return [r.id for r in rows]
+
+    stripped_refs = {_strip_vn_diacritics(x).upper() for x in variants}
+
+    # 3. num/year/... — SQL narrow to num/year/, then normalize match in Python
+    m_full = re.match(r"(\d{1,4})/(\d{4})/(.+)$", doc_num)
+    if m_full:
+        num, year = m_full.group(1), m_full.group(2)
+        sql_prefix = f"{num}/{year}/%"
+        stmt = (
+            select(Document.id, Document.doc_number)
+            .where(Document.doc_number.like(sql_prefix))
+            .limit(50)
+        )
+        rows = (await db.execute(stmt)).all()
+        matches: List = []
+        for r in rows:
+            sn = _strip_vn_diacritics(r.doc_number).upper()
+            for sr in stripped_refs:
+                if sn == sr or sn.startswith(sr):
+                    matches.append(r)
+                    break
+        if matches:
+            log.info(
+                "[DOC_NUM_LOOKUP] Num/year fuzzy: '%s' → %s",
+                doc_num,
+                [(r.id, r.doc_number) for r in matches[:5]],
+            )
+            return [r.id for r in matches[:5]]
+
+    # 4. num/type (no calendar year in middle) e.g. 06/CT-UBND
+    if not re.search(r"\d{4}", doc_num):
+        m_head = re.match(r"(\d{1,4})/", doc_num)
+        if m_head:
+            pref = f"{m_head.group(1)}/"
+            stmt = (
+                select(Document.id, Document.doc_number)
+                .where(Document.doc_number.like(f"{pref}%"))
+                .limit(40)
+            )
+            rows = (await db.execute(stmt)).all()
+            matches = []
+            for r in rows:
+                sn = _strip_vn_diacritics(r.doc_number).upper()
+                for sr in stripped_refs:
+                    if sn == sr or sn.startswith(sr):
+                        matches.append(r)
+                        break
+            if matches:
+                log.info(
+                    "[DOC_NUM_LOOKUP] No-year fuzzy: '%s' → %s",
+                    doc_num,
+                    [(r.id, r.doc_number) for r in matches[:5]],
+                )
+                return [r.id for r in matches[:5]]
 
     return []
 
@@ -491,7 +574,11 @@ async def _find_documents(
     if conditions:
         stmt = stmt.where(*conditions)
 
-    stmt = stmt.limit(10)
+    stmt = stmt.order_by(
+        nulls_last(desc(Document.effective_date)),
+        nulls_last(desc(Document.issued_date)),
+        desc(Document.id),
+    ).limit(10)
     result = await db.execute(stmt)
     rows = result.all()
 
@@ -506,7 +593,11 @@ async def _find_documents(
                         func.lower(Document.doc_number).contains(kw.lower()),
                     )
                 )
-            stmt2 = stmt2.limit(10)
+            stmt2 = stmt2.order_by(
+                nulls_last(desc(Document.effective_date)),
+                nulls_last(desc(Document.issued_date)),
+                desc(Document.id),
+            ).limit(10)
             result = await db.execute(stmt2)
             rows = result.all()
 

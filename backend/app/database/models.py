@@ -42,7 +42,10 @@ class Document(Base):
     doc_number = Column(String(255), index=True, comment="e.g. 13/2025/TT-BVHTTDL")
     title = Column(Text)
     document_type = Column(String(50), index=True, comment="Luật, Nghị định, Thông tư, ...")
-    issuer = Column(String(255), comment="Cơ quan ban hành")
+    issuer = Column(  # Theo pipeline ingest: trích yếu (vd. dòng "VỀ VIỆC ..."), không phải tên cơ quan
+        Text,
+        comment="Trích yếu / chủ đề văn bản (vd. VỀ VIỆC ...); do ingest tự trích",
+    )
     issued_date = Column(Date)
     effective_date = Column(Date)
     file_path = Column(Text)

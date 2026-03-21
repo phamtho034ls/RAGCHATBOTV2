@@ -25,6 +25,7 @@ async def chat(req: ChatRequest, db: AsyncSession = Depends(get_db)):
         db=db,
         temperature=req.temperature,
         doc_number=req.doc_number,
+        conversation_id=req.conversation_id,
     )
     return ChatResponse(**result)
 
@@ -39,6 +40,7 @@ async def chat_stream(req: ChatRequest, db: AsyncSession = Depends(get_db)):
             db=db,
             temperature=req.temperature,
             doc_number=req.doc_number,
+            conversation_id=req.conversation_id,
         ):
             yield f"data: {json.dumps({'token': token}, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"

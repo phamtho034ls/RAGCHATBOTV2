@@ -20,6 +20,7 @@ from typing import AsyncGenerator, Dict, List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import (
+    ANSWER_VALIDATION_THRESHOLD,
     DEFAULT_TEMPERATURE,
     MULTI_ARTICLE_MAX_ARTICLES,
     OPENAI_MODEL,
@@ -28,17 +29,17 @@ from app.config import (
     COMMUNE_OFFICER_SYSTEM_PROMPT,
     COMMUNE_OFFICER_RAG_TEMPLATE,
     NO_INFO_MESSAGE,
-    USE_INTENT_CLASSIFIER,
     USE_MULTI_ARTICLE_FOR_CONDITIONS,
 )
 from app.retrieval.hybrid_retriever import hybrid_search
+from app.retrieval.vector_retriever import vector_search
 from app.cache.redis_cache import get_cached_answer, cache_answer
 from app.monitoring.chat_logger import log_interaction
-from app.services.llm_client import generate
+from app.services.llm_client import generate, generate_with_messages
 from app.services.answer_validator import validate_article_completeness
 from app.services.query_understanding import analyze_query
-from app.services.query_expansion import needs_expansion, expand_query
-from app.services.intent_classifier import get_rag_intents
+from app.services.query_expansion import needs_expansion, expand_query, should_expand_query_v2
+from app.services.intent_detector import get_rag_intents
 from app.services.article_grouper import (
     dedup_chunks,
     group_chunks_by_article,
@@ -49,79 +50,9 @@ from app.tools import draft_tool
 
 log = logging.getLogger(__name__)
 
-_SCENARIO_INDICATORS = re.compile(
-    r"(?:"
-    r"ông[\s/]bà\s+(hãy|sẽ|cần|nên|xây dựng|lập|tổ chức|xử lý|hướng dẫn|cho biết|giải thích)"
-    r"|hãy\s+(đề xuất|tham mưu|xử lý|hướng dẫn|giải thích|lập kế hoạch|xây dựng|cho biết|nêu)"
-    r"|xử\s+lý\s+(tình huống|vấn đề|vi phạm|trường hợp)"
-    r"|tham\s+mưu"
-    r"|(?:cần|nên|phải)\s+(?:làm gì|xử lý|giải quyết)"
-    r"|làm\s+(?:thế nào|sao)\s+(?:để|khi)"
-    r"|(?:kế hoạch|phương án|giải pháp)\s+(?:ra sao|như thế nào|nào|gì)"
-    r"|(?:đề xuất|kiến nghị)\s+(?:\d+\s+)?(?:giải pháp|biện pháp|phương án)"
-    r"|(?:trên\s+địa\s+bàn|tại\s+(?:xã|phường|thị trấn|địa phương))"
-    r"|(?:của\s+xã|của\s+phường|của\s+thị\s+trấn)"
-    r"|(?:phối\s+hợp|liên\s+ngành|vận\s+động|tuyên\s+truyền)"
-    r"|(?:biện\s+pháp|giải\s+pháp)\s+(?:lâu\s+dài|phòng\s+ngừa|ngăn\s+chặn)"
-    r"|(?:ra\s+quân|chấn\s+chỉnh|xử\s+lý\s+các\s+vi\s+phạm)"
-    r"|(?:kế\s+hoạch)\s+(?:ra\s+quân|kiểm\s+tra|chấn\s+chỉnh|tuyên\s+truyền)"
-    r")",
-    re.IGNORECASE,
-)
-
-_LEGAL_LOOKUP_INDICATORS = re.compile(
-    r"(?:"
-    r"điều\s+\d+\s+(?:quy định|nêu|nói|ghi|là gì|trong)"
-    r"|(?:tóm tắt|nội dung)\s+(?:nghị định|luật|thông tư|quyết định|chỉ thị)"
-    r"|\b\d+/\d{4}/[A-ZĐa-zđ\-]+"
-    r"|(?:quy định|nội dung)\s+(?:của\s+)?điều\s+\d+"
-    r")",
-    re.IGNORECASE,
-)
-
-_MULTI_ARTICLE_QUERY_RE = re.compile(
-    r"(?:"
-    r"\bđiều kiện\b"
-    r"|\bquy định\s+(về|của)\b"
-    r"|\b(kinh doanh|hoạt động)\b.*\b(điều kiện|quy định)\b"
-    r"|\bcác\s+văn bản\b.*\b(quy định|liên quan)\b"
-    r"|\bso sánh\b|\bđối chiếu\b|\bkhác nhau\b"
-    r"|\b(luật|nghị định)\b.*\b(điều kiện|quy định)\b"
-    r"|\bphát triển\b.*\b(thể thao|văn hóa|giáo dục)\b"
-    r"|\bthể thao thành tích cao\b"
-    r"|\bxây dựng cơ sở vật chất\b.*\bthể thao\b"
-    r")",
-    re.IGNORECASE,
-)
-
-
-def _should_use_multi_article_context(query: str) -> bool:
-    """True if query asks for conditions/regulations/comparison and config allows multi-article context."""
-    if not USE_MULTI_ARTICLE_FOR_CONDITIONS:
-        return False
-    return bool(_MULTI_ARTICLE_QUERY_RE.search(query or ""))
-
-
-def _is_scenario_query(query: str) -> bool:
-    """Detect scenario-based administrative questions that need practical guidance."""
-    if _LEGAL_LOOKUP_INDICATORS.search(query):
-        return False
-    return bool(_SCENARIO_INDICATORS.search(query))
-
-
 def _get_rag_intent_flags(query: str) -> Dict[str, bool]:
-    """Lấy các flag cho RAG: dùng intent classifier nếu bật, không thì dùng regex."""
-    if USE_INTENT_CLASSIFIER:
-        try:
-            return get_rag_intents(query)
-        except Exception as e:
-            log.warning("Intent classifier failed, falling back to regex: %s", e)
-    return {
-        "is_scenario": _is_scenario_query(query),
-        "is_legal_lookup": bool(_LEGAL_LOOKUP_INDICATORS.search(query or "")),
-        "use_multi_article": _should_use_multi_article_context(query),
-        "needs_expansion": needs_expansion(query),
-    }
+    """Cờ RAG từ intent_detector (structural + semantic embedding), không dùng regex scenario/multi-article."""
+    return get_rag_intents(query)
 
 
 async def _multi_query_retrieve(
@@ -149,9 +80,13 @@ async def _multi_query_retrieve(
 
     for variant in variants:
         passages = await hybrid_search(
-            query=variant, db=db, top_k=top_k,
-            doc_number=doc_number, single_article_only=False,
+            query=variant,
+            db=db,
+            top_k=top_k,
+            doc_number=doc_number,
+            single_article_only=False,
             legal_domains=legal_domains,
+            doc_number_source_query=query,
         )
         all_passages.extend(passages)
 
@@ -286,6 +221,82 @@ def _build_document_lookup_answer(sources: List[Dict]) -> str:
     if citation_block:
         lines.append(citation_block)
     return "\n".join(lines)
+
+
+def _build_multi_source_answer(query: str, sources: List[Dict]) -> str:
+    """Deterministic multi-source answer to avoid collapsing into one article."""
+    if not sources:
+        return NO_INFO_MESSAGE
+
+    docs: List[str] = []
+    seen_docs = set()
+    for s in sources:
+        label = _format_doc_label(s)
+        if not label:
+            continue
+        key = label.lower()
+        if key in seen_docs:
+            continue
+        seen_docs.add(key)
+        docs.append(label)
+
+    citations: List[str] = []
+    seen_cites = set()
+    for s in sources:
+        cite = (s.get("citation") or "").strip()
+        if not cite:
+            label = _format_doc_label(s)
+            article = _normalize_article_number(s.get("article_number"))
+            cite = f"{label} – Điều {article}" if label and article else label
+        if not cite:
+            continue
+        k = cite.lower()
+        if k in seen_cites:
+            continue
+        seen_cites.add(k)
+        citations.append(cite)
+
+    lines = [
+        "Câu trả lời:",
+        "",
+        f"Câu hỏi \"{query}\" được tổng hợp từ nhiều nguồn pháp lý trong cơ sở dữ liệu hiện có.",
+    ]
+    if docs:
+        lines.extend(["", "Các văn bản pháp luật liên quan:"])
+        lines.extend([f"- {d}" for d in docs[:12]])
+    if citations:
+        lines.extend(["", "Các điều khoản tiêu biểu liên quan:"])
+        lines.extend([f"- {c}" for c in citations[:15]])
+    lines.extend([
+        "",
+        "Lưu ý: Danh mục ngành, nghề đầu tư kinh doanh có điều kiện cần đối chiếu theo phụ lục/danh mục ban hành kèm văn bản còn hiệu lực tại thời điểm áp dụng.",
+    ])
+    return "\n".join(lines)
+
+
+def _should_use_multi_source_summary(
+    query: str,
+    sources: List[Dict],
+    *,
+    use_multi: bool,
+    multi_article_conditions: bool,
+) -> bool:
+    """Decide format by retrieval diversity instead of manual query regex."""
+    if not sources:
+        return False
+    if _is_document_lookup_query(query) or _query_demands_specific_article(query):
+        return False
+
+    unique_articles = len({s.get("article_id") for s in sources if s.get("article_id")})
+    unique_docs = len({(s.get("doc_number") or "").strip() for s in sources if (s.get("doc_number") or "").strip()})
+
+    # Strong evidence from retrieval diversity.
+    if unique_articles >= 3 and unique_docs >= 2:
+        return True
+    # Weaker diversity but query already routed to multi-article path.
+    if (use_multi or multi_article_conditions) and unique_articles >= 3:
+        return True
+    return False
 
 
 def _select_single_article_passages(passages: List[Dict], query: str) -> List[Dict]:
@@ -712,11 +723,19 @@ async def _answer_drafting_query(query: str, temperature: float) -> Dict:
     return {"answer": answer, "sources": sources, "confidence_score": confidence}
 
 
+def _with_conv_meta(result: Dict, conversation_id: str, retried: bool = False) -> Dict:
+    out = dict(result)
+    out["conversation_id"] = conversation_id
+    out["retried"] = retried
+    return out
+
+
 async def rag_query(
     query: str,
     db: AsyncSession,
     temperature: float = DEFAULT_TEMPERATURE,
     doc_number: Optional[str] = None,
+    conversation_id: Optional[str] = None,
 ) -> Dict:
     """Run the full RAG pipeline: retrieve → build context → generate answer.
 
@@ -727,6 +746,13 @@ async def rag_query(
     """
     start_time = time.time()
 
+    from app.memory.conversation_store import conversation_store
+
+    if conversation_id and conversation_store.get(conversation_id):
+        conv_id = conversation_id
+    else:
+        conv_id = conversation_store.create()["id"]
+
     # ── 0. Ninh Bình tool: câu hỏi phi pháp lý về Ninh Bình (địa lý, huyện, du lịch...)
     from app.services.ninh_binh_router import should_use_ninh_binh_tool, route_to_ninh_binh
     if should_use_ninh_binh_tool(query):
@@ -734,11 +760,14 @@ async def rag_query(
         if nb_result:
             latency = (time.time() - start_time) * 1000
             await log_interaction(db, query, nb_result.get("answer", ""), [], 0.85, latency)
-            return {
-                "answer": nb_result.get("answer", ""),
-                "sources": nb_result.get("sources", []),
-                "confidence_score": 0.85,
-            }
+            return _with_conv_meta(
+                {
+                    "answer": nb_result.get("answer", ""),
+                    "sources": nb_result.get("sources", []),
+                    "confidence_score": 0.85,
+                },
+                conv_id,
+            )
 
     analysis = analyze_query(query)
     intent = analysis.get("intent", "")
@@ -753,16 +782,15 @@ async def rag_query(
             domain_filter,
         )
 
-    # ── 1b. Intent flags (tự nhận diện bằng embedding hoặc regex) ──
+    # ── 1b. RAG intent flags — intent_detector (structural + semantic embedding) ──
     rag_intents = _get_rag_intent_flags(query)
-    if USE_INTENT_CLASSIFIER:
-        log.info(
-            "Intent classifier: scenario=%s legal_lookup=%s multi_article=%s needs_expansion=%s",
-            rag_intents.get("is_scenario"),
-            rag_intents.get("is_legal_lookup"),
-            rag_intents.get("use_multi_article"),
-            rag_intents.get("needs_expansion"),
-        )
+    log.info(
+        "RAG intents (intent_detector): scenario=%s legal_lookup=%s multi_article=%s needs_expansion=%s",
+        rag_intents.get("is_scenario"),
+        rag_intents.get("is_legal_lookup"),
+        rag_intents.get("use_multi_article"),
+        rag_intents.get("needs_expansion"),
+    )
 
     # ── 1. Check cache ───────────────────────────────────
     skip_cache = intent in {"checklist_documents", "document_drafting", "document_summary"}
@@ -778,7 +806,7 @@ async def rag_query(
                 log.warning("Ignoring stale no-info cache with existing sources: '%.50s...'", query)
             else:
                 log.info("Cache hit for query: '%.50s...'", query)
-                return cached
+                return _with_conv_meta(dict(cached), conv_id, retried=cached.get("retried", False))
 
     # ── Commune-level intent routing ─────────────────────
     from app.services.intent_detector import COMMUNE_LEVEL_INTENTS
@@ -786,7 +814,7 @@ async def rag_query(
     is_commune_query = (
         intent in COMMUNE_LEVEL_INTENTS
         or (commune_situation and commune_situation.get("violation", "không có") != "không có")
-        or rag_intents.get("is_scenario", _is_scenario_query(query))
+        or rag_intents.get("is_scenario", False)
     )
 
     if is_commune_query:
@@ -804,7 +832,7 @@ async def rag_query(
             db, query, result.get("answer", ""),
             doc_numbers, result.get("confidence_score", 0.0), latency,
         )
-        return result
+        return _with_conv_meta(result, conv_id)
 
     # Intent-specific routes
     if intent == "checklist_documents":
@@ -826,7 +854,7 @@ async def rag_query(
             result.get("confidence_score", 0.0),
             latency,
         )
-        return result
+        return _with_conv_meta(result, conv_id)
 
     if intent == "document_drafting":
         result = await _answer_drafting_query(query=query, temperature=temperature)
@@ -841,7 +869,7 @@ async def rag_query(
             result.get("confidence_score", 0.0),
             latency,
         )
-        return result
+        return _with_conv_meta(result, conv_id)
 
     if intent == "document_summary":
         from app.services.document_summarizer import list_document_articles
@@ -858,11 +886,21 @@ async def rag_query(
             db, query, result["answer"], doc_numbers,
             result["confidence_score"], latency,
         )
-        return result
+        return _with_conv_meta(result, conv_id)
 
     # ── 2. Hybrid retrieval (with multi-query expansion) ──
-    use_multi = rag_intents.get("needs_expansion", needs_expansion(query))
-    multi_article_conditions = rag_intents.get("use_multi_article", _should_use_multi_article_context(query))
+    initial_for_expand = vector_search(
+        query=query,
+        top_k=8,
+        doc_number=doc_number,
+        legal_domains=domain_filter,
+    )
+    use_multi = rag_intents.get("needs_expansion", False) or should_expand_query_v2(
+        query, initial_for_expand
+    )
+    multi_article_conditions = (
+        rag_intents.get("use_multi_article", False) and USE_MULTI_ARTICLE_FOR_CONDITIONS
+    )
     if use_multi:
         passages = await _multi_query_retrieve(
             query=query, db=db, doc_number=doc_number,
@@ -889,7 +927,7 @@ async def rag_query(
         }
         latency = (time.time() - start_time) * 1000
         await log_interaction(db, query, answer, [], 0.0, latency)
-        return result
+        return _with_conv_meta(result, conv_id)
 
     # For multi-article / condition queries, group by article for structured context
     if use_multi or multi_article_conditions or any(p.get("_db_lookup") for p in passages):
@@ -901,8 +939,16 @@ async def rag_query(
         context = _build_context(passages)
     sources = _extract_sources(passages)
 
+    prefer_multi_source_summary = _should_use_multi_source_summary(
+        query,
+        sources,
+        use_multi=bool(use_multi),
+        multi_article_conditions=bool(multi_article_conditions),
+    )
+
     # Query type: user asks "which legal document(s)".
-    if _is_document_lookup_query(query):
+    # If retrieval evidence is strongly multi-source, prefer synthesis mode below.
+    if _is_document_lookup_query(query) and not prefer_multi_source_summary:
         answer = _build_document_lookup_answer(sources)
         confidence = _compute_confidence(passages, answer)
         result = {
@@ -914,16 +960,42 @@ async def rag_query(
         latency = (time.time() - start_time) * 1000
         doc_numbers = list({s.get("doc_number", "") for s in sources})
         await log_interaction(db, query, answer, doc_numbers, confidence, latency)
-        return result
+        return _with_conv_meta(result, conv_id)
+
+    if prefer_multi_source_summary:
+        answer = _build_multi_source_answer(query, sources)
+        answer = _ensure_legal_citations(answer, sources)
+        answer = _ensure_response_format(answer)
+        confidence = _compute_confidence(passages, answer)
+        result = {
+            "answer": answer,
+            "sources": sources,
+            "confidence_score": confidence,
+        }
+        await cache_answer(query, result)
+        latency = (time.time() - start_time) * 1000
+        doc_numbers = list({s.get("doc_number", "") for s in sources})
+        await log_interaction(db, query, answer, doc_numbers, confidence, latency)
+        return _with_conv_meta(result, conv_id)
 
     # ── 4. Generate answer ───────────────────────────────
     prompt = RAG_PROMPT_TEMPLATE_V2.format(context=context, question=query)
 
-    answer = await generate(
-        prompt=prompt,
-        system=SYSTEM_PROMPT_V2,
-        temperature=temperature,
-    )
+    hist = conversation_store.get_history(conv_id, limit=20)
+    conv_messages = [{"role": m["role"], "content": m["content"]} for m in hist if m.get("role") in ("user", "assistant")]
+    if conv_messages:
+        messages = (
+            [{"role": "system", "content": SYSTEM_PROMPT_V2}]
+            + conv_messages
+            + [{"role": "user", "content": prompt}]
+        )
+        answer = await generate_with_messages(messages, temperature=temperature)
+    else:
+        answer = await generate(
+            prompt=prompt,
+            system=SYSTEM_PROMPT_V2,
+            temperature=temperature,
+        )
 
     # ── 5. Sanitize output (strip leaked metadata) ───────
     answer = _sanitize_output(answer)
@@ -1012,8 +1084,81 @@ async def rag_query(
     answer = _ensure_document_list(answer, sources)
     answer = _ensure_response_format(answer)
 
-    # ── 9. Compute confidence ────────────────────────────
+    # ── 9. Compute confidence + V3 retry (multi-article) / fallback ──
     confidence = _compute_confidence(passages, answer)
+    retried = False
+
+    if (
+        intent != "hoi_dap_chung"
+        and confidence >= 0.20
+        and confidence < ANSWER_VALIDATION_THRESHOLD
+        and not use_multi
+        and not multi_article_conditions
+    ):
+        from app.retrieval.article_selection import dynamic_max_articles, diversify_by_article
+
+        passages2 = await hybrid_search(
+            query=query,
+            db=db,
+            doc_number=doc_number,
+            legal_domains=domain_filter,
+            single_article_only=False,
+            max_articles=MULTI_ARTICLE_MAX_ARTICLES,
+        )
+        if passages2:
+            passages2 = diversify_by_article(passages2, min_docs=3)
+            _ = dynamic_max_articles(passages2)
+            groups2 = group_chunks_by_article(dedup_chunks(passages2))
+            context2 = format_grouped_context(groups2)
+            sources2 = _extract_sources(passages2)
+            prompt2 = RAG_PROMPT_TEMPLATE_V2.format(context=context2, question=query)
+            answer2 = await generate(
+                prompt=prompt2,
+                system=SYSTEM_PROMPT_V2,
+                temperature=temperature,
+            )
+            answer2 = _sanitize_output(answer2)
+            answer2 = _force_no_info_if_needed(answer2)
+            context_nums2 = _collect_context_doc_numbers(passages2)
+            answer2 = _strip_hallucinated_doc_numbers(answer2, context_nums2)
+            if _is_no_info_answer(answer2) and sources2:
+                answer2 = _build_related_documents_fallback(sources2)
+            answer2 = _ensure_legal_citations(answer2, sources2)
+            answer2 = _ensure_document_list(answer2, sources2)
+            answer2 = _ensure_response_format(answer2)
+            conf2 = _compute_confidence(passages2, answer2)
+            prev_conf = confidence
+            if conf2 >= ANSWER_VALIDATION_THRESHOLD or conf2 > confidence:
+                passages, context, sources, answer, confidence = (
+                    passages2,
+                    context2,
+                    sources2,
+                    answer2,
+                    conf2,
+                )
+                retried = True
+                log.info(
+                    "RAG validation retry: adopted multi-article path (confidence %.3f → %.3f)",
+                    prev_conf,
+                    conf2,
+                )
+
+    if (
+        intent != "hoi_dap_chung"
+        and confidence >= 0.20
+        and confidence < ANSWER_VALIDATION_THRESHOLD
+    ):
+        try:
+            from app.services.rag_chain import _fallback_reasoning
+
+            fb = await _fallback_reasoning(query, intent)
+            if fb and len(fb.strip()) > 20:
+                answer = fb
+                sources = []
+                confidence = min(confidence, 0.35)
+                log.info("RAG fallback_reasoning applied (confidence still below %.2f)", ANSWER_VALIDATION_THRESHOLD)
+        except Exception as exc:
+            log.error("fallback_reasoning failed: %s", exc)
 
     # ── 10. Cache result ─────────────────────────────────
     result = {
@@ -1023,12 +1168,17 @@ async def rag_query(
     }
     await cache_answer(query, result)
 
-    # ── 11. Log interaction ──────────────────────────────
+    # ── 11. Log interaction + conversation memory ────────
     latency = (time.time() - start_time) * 1000
     doc_numbers = list({s.get("doc_number", "") for s in sources})
     await log_interaction(db, query, answer, doc_numbers, confidence, latency)
+    try:
+        conversation_store.add_message(conv_id, "user", query)
+        conversation_store.add_message(conv_id, "assistant", answer)
+    except Exception as exc:
+        log.error("conversation_store add_message failed: %s", exc)
 
-    return result
+    return _with_conv_meta(result, conv_id, retried=retried)
 
 
 async def rag_query_stream(
@@ -1036,6 +1186,7 @@ async def rag_query_stream(
     db: AsyncSession,
     temperature: float = DEFAULT_TEMPERATURE,
     doc_number: Optional[str] = None,
+    conversation_id: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
     """Streaming wrapper that guarantees the same post-processed output as rag_query."""
     result = await rag_query(
@@ -1043,7 +1194,19 @@ async def rag_query_stream(
         db=db,
         temperature=temperature,
         doc_number=doc_number,
+        conversation_id=conversation_id,
     )
+
+    meta_event = json.dumps(
+        {
+            "type": "meta",
+            "conversation_id": result.get("conversation_id"),
+            "retried": result.get("retried", False),
+            "confidence_score": result.get("confidence_score", 0.0),
+        },
+        ensure_ascii=False,
+    )
+    yield meta_event + "\n"
 
     sources_event = json.dumps(
         {"type": "sources", "data": result.get("sources", [])},

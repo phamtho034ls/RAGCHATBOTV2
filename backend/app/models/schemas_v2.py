@@ -44,6 +44,8 @@ class ChatResponse(BaseModel):
     answer: str
     sources: List[SourceInfo] = []
     confidence_score: float = 0.0
+    conversation_id: Optional[str] = None
+    retried: bool = False
 
 
 # ── Upload ────────────────────────────────────────────────

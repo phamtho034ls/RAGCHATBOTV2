@@ -1,0 +1,5 @@
+[
+  {"query": "Điều 6 Luật Đầu tư 2025 quy định gì?", "expected_intent": "article_query", "expected_has_answer": true, "expected_min_confidence": 0.3},
+  {"query": "Tóm tắt nội dung 36/2019/NĐ-CP", "expected_intent": "article_query", "expected_has_answer": true, "expected_min_confidence": 0.3},
+  {"query": "Lập báo cáo tổng kết năm 2025", "expected_intent": "tao_bao_cao", "expected_has_answer": false, "expected_min_confidence": 0.0}
+]

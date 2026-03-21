@@ -84,6 +84,11 @@ async def init_db() -> None:
                 "ALTER COLUMN doc_number TYPE VARCHAR(255)"
             )
         )
+        # Bảng cũ có thể tạo title/issuer/file_path VARCHAR(255) — canonical title + path dài cần TEXT
+        for col in ("title", "issuer", "file_path"):
+            await conn.execute(
+                text(f"ALTER TABLE documents ALTER COLUMN {col} TYPE TEXT")
+            )
         await conn.execute(
             text(
                 "ALTER TABLE vector_chunks "

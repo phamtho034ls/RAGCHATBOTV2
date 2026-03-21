@@ -40,6 +40,52 @@ def needs_expansion(query: str) -> bool:
     return bool(_EXPANSION_TRIGGERS.search(query or ""))
 
 
+def should_expand_query_v2(query: str, initial_results: List[dict]) -> bool:
+    """V3: quyết định mở rộng truy vấn — ML similarity + diversity + keyword (_EXPANSION_TRIGGERS).
+
+    Dùng embedding model hiện có (embed_query / embed_texts), không load model mới.
+    Expand nếu BẤT KỲ signal nào đúng.
+    """
+    q = query or ""
+
+    if needs_expansion(q):
+        return True
+
+    top5 = initial_results[:5]
+    doc_ids = {p.get("document_id") for p in top5 if p.get("document_id") is not None}
+    if len(doc_ids) == 1 and len(top5) >= 2:
+        log.debug("should_expand_query_v2: diversity signal (single doc in top-5)")
+        return True
+
+    if not initial_results:
+        return False
+
+    try:
+        import numpy as np
+
+        from app.pipeline.embedding import embed_query, embed_texts
+
+        qv = np.asarray(embed_query(q), dtype=np.float32)
+        qn = float(np.linalg.norm(qv)) + 1e-12
+        texts = [(p.get("text_chunk") or "")[:2000] for p in initial_results[:8]]
+        texts = [t for t in texts if t.strip()]
+        if not texts:
+            return False
+        pv = embed_texts(texts)
+        if pv.size == 0:
+            return False
+        pn = np.linalg.norm(pv, axis=1, keepdims=True) + 1e-12
+        sims = np.dot(pv, qv) / (pn.flatten() * qn)
+        max_sim = float(np.max(sims))
+        if max_sim < 0.55:
+            log.debug("should_expand_query_v2: low max_similarity=%.3f", max_sim)
+            return True
+    except Exception as exc:
+        log.warning("should_expand_query_v2 embedding signal failed: %s", exc)
+
+    return False
+
+
 async def expand_query(query: str, max_variants: int = 3) -> List[str]:
     """Expand query into sub-queries for broader multi-article retrieval.
 
@@ -65,6 +111,7 @@ YÊU CẦU:
 - Mỗi câu truy vấn tập trung vào một khía cạnh khác nhau
 - Giữ nguyên tên luật/nghị định nếu có
 - Bổ sung từ khóa pháp lý cụ thể
+- TUYỆT ĐỐI KHÔNG thêm số hiệu văn bản (dạng xx/yyyy/NĐ-CP, TT-BTC, QĐ-UBND, …) nếu câu gốc không có số hiệu đó — không được bịa số hiệu
 - Mỗi câu một dòng, KHÔNG đánh số, KHÔNG giải thích
 
 Các câu truy vấn phụ:"""

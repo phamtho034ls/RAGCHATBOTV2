@@ -811,9 +811,9 @@ async def detect_intent(query: str) -> Dict[str, object]:
 # ══════════════════════════════════════════════════════════════
 
 def detect_intent_rule_based(query: str) -> Tuple[str, float]:
-    """DEPRECATED: Kept for backward compatibility.
+    """Structural + semantic (embedding prototype) intent, không gọi LLM.
 
-    Returns structural/semantic result or low-confidence fallback.
+    Dùng bởi `get_rag_intents()` để ánh xạ intent → cờ RAG (v3).
     """
     if not query or not query.strip():
         return "hoi_dap_chung", 0.10
@@ -829,3 +829,110 @@ def detect_intent_rule_based(query: str) -> Tuple[str, float]:
         return semantic
 
     return "hoi_dap_chung", 0.30
+
+
+# ══════════════════════════════════════════════════════════════
+# RAG FLAGS (v3) — ánh xạ intent → luồng rag_chain_v2
+# ══════════════════════════════════════════════════════════════
+
+_RAG_LEGAL_LOOKUP_INTENTS: frozenset = frozenset({"article_query"})
+
+_RAG_NEEDS_EXPANSION_INTENTS: frozenset = frozenset({
+    "tra_cuu_van_ban",
+    "trich_xuat_van_ban",
+    "tom_tat_van_ban",
+    "program_goal",
+    "tao_bao_cao",
+})
+
+_RAG_MULTI_ARTICLE_INTENTS: frozenset = frozenset({
+    "so_sanh_van_ban",
+    "document_relation",
+    "can_cu_phap_ly",
+    "admin_planning",
+    "trich_xuat_van_ban",
+})
+
+_RAG_SCENARIO_INTENTS: frozenset = frozenset({
+    "xu_ly_vi_pham_hanh_chinh",
+    "kiem_tra_thanh_tra",
+    "thu_tuc_hanh_chinh",
+    "hoa_giai_van_dong",
+    "bao_ve_xa_hoi",
+    "to_chuc_su_kien_cong",
+    "bao_ton_phat_trien",
+    "kiem_tra_ho_so",
+    "soan_thao_van_ban",
+    "giai_thich_quy_dinh",
+    "huong_dan_thu_tuc",
+})
+
+
+def map_intent_to_rag_flags(intent: str) -> Dict[str, bool]:
+    """Ánh xạ một intent (chuỗi) sang 4 cờ RAG. Intent không thuộc nhóm nào → tất cả False."""
+    if not intent or intent not in VALID_INTENTS:
+        return {
+            "is_scenario": False,
+            "is_legal_lookup": False,
+            "use_multi_article": False,
+            "needs_expansion": False,
+        }
+    return {
+        "is_legal_lookup": intent in _RAG_LEGAL_LOOKUP_INTENTS,
+        "needs_expansion": intent in _RAG_NEEDS_EXPANSION_INTENTS,
+        "use_multi_article": intent in _RAG_MULTI_ARTICLE_INTENTS,
+        "is_scenario": intent in _RAG_SCENARIO_INTENTS,
+    }
+
+
+def get_rag_intents(query: str) -> Dict[str, bool]:
+    """Cờ RAG cho rag_chain_v2 — nguồn duy nhất: intent_detector (structural + semantic).
+
+    Gọi `detect_intent_rule_based` (embedding prototypes + regex cấu trúc), không dùng LLM.
+    """
+    try:
+        q = query or ""
+        intent, _conf = detect_intent_rule_based(q)
+        flags = map_intent_to_rag_flags(intent)
+
+        q_lower = q.lower()
+        multi_article_markers = [
+            "ngành, nghề đầu tư kinh doanh có điều kiện",
+            "ngành nghề đầu tư kinh doanh có điều kiện",
+            "danh mục ngành nghề",
+            "danh mục",
+            "bao gồm",
+            "liệt kê",
+            "các điều",
+            "những điều",
+        ]
+        if any(m in q_lower for m in multi_article_markers):
+            flags["needs_expansion"] = True
+            flags["use_multi_article"] = True
+
+        log.debug("get_rag_intents: intent=%s → %s", intent, flags)
+        return flags
+    except Exception as exc:
+        log.warning("get_rag_intents failed: %s", exc)
+        return {
+            "is_scenario": False,
+            "is_legal_lookup": False,
+            "use_multi_article": False,
+            "needs_expansion": False,
+        }
+
+
+async def get_rag_intents_async(query: str) -> Dict[str, bool]:
+    """Giống get_rag_intents nhưng dùng full `detect_intent` (có LLM khi cần)."""
+    try:
+        result = await detect_intent(query or "")
+        intent = str(result.get("intent", "hoi_dap_chung"))
+        return map_intent_to_rag_flags(intent)
+    except Exception as exc:
+        log.warning("get_rag_intents_async failed: %s", exc)
+        return {
+            "is_scenario": False,
+            "is_legal_lookup": False,
+            "use_multi_article": False,
+            "needs_expansion": False,
+        }

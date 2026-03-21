@@ -24,6 +24,16 @@ from app.memory.conversation_store import conversation_store
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 
 
+@router.get("/{conversation_id}/history")
+async def get_conversation_history(conversation_id: str, limit: int = 20):
+    """Lịch sử tin nhắn (10 lượt gần nhất ≈ limit messages)."""
+    conv = conversation_store.get(conversation_id)
+    if not conv:
+        raise HTTPException(404, "Conversation không tồn tại")
+    msgs = conversation_store.get_history(conversation_id, limit=limit)
+    return {"conversation_id": conversation_id, "messages": msgs}
+
+
 @router.get("", response_model=ConversationListResponse)
 async def list_conversations():
     """Liệt kê tất cả conversations (mới nhất trước)."""

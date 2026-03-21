@@ -4,6 +4,19 @@
 
 const BASE = ""; // proxy qua Vite → localhost:8000
 
+/** FastAPI detail: string | { msg }[] | object */
+function formatApiDetail(detail) {
+  if (detail == null) return "";
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail
+      .map((e) => (e && typeof e === "object" ? e.msg || JSON.stringify(e) : String(e)))
+      .join("; ");
+  }
+  if (typeof detail === "object") return JSON.stringify(detail);
+  return String(detail);
+}
+
 // ── Generic fetch ─────────────────────────────────────────
 async function apiFetch(path, options = {}) {
   const res = await fetch(`${BASE}${path}`, {
@@ -12,7 +25,8 @@ async function apiFetch(path, options = {}) {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || `Request failed: ${res.status}`);
+    const msg = formatApiDetail(err.detail);
+    throw new Error(msg || `Request failed: ${res.status}`);
   }
   return res.json();
 }
@@ -24,7 +38,7 @@ export async function uploadDocx(file) {
   const res = await fetch(`${BASE}/api/upload`, { method: "POST", body: form });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || "Upload thất bại");
+    throw new Error(formatApiDetail(err.detail) || "Upload thất bại");
   }
   return res.json();
 }
@@ -38,7 +52,7 @@ export async function uploadFolder(files) {
   const res = await fetch(`${BASE}/api/upload-folder`, { method: "POST", body: form });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || "Upload folder thất bại");
+    throw new Error(formatApiDetail(err.detail) || "Upload folder thất bại");
   }
   return res.json();
 }
@@ -53,13 +67,30 @@ export async function deleteDataset(id) {
 }
 
 // ── Chat (SSE streaming) ─────────────────────────────────
-export async function chatStream(question, temperature, onToken, onSources, onDone) {
+export async function getIntentIndexStats() {
+  return apiFetch("/api/intent/index-stats");
+}
+
+export async function listConversations() {
+  return apiFetch("/api/conversations");
+}
+
+export async function chatStream(
+  question,
+  temperature,
+  onToken,
+  onSources,
+  onDone,
+  conversationId = null,
+  onMeta = null
+) {
   const res = await fetch(`${BASE}/api/chat/stream`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       question,
       temperature,
+      conversation_id: conversationId || undefined,
     }),
   });
 
@@ -98,6 +129,10 @@ export async function chatStream(question, temperature, onToken, onSources, onDo
             const inner = JSON.parse(data.token);
             if (inner.type === "sources") {
               onSources?.(inner.data);
+              continue;
+            }
+            if (inner.type === "meta") {
+              onMeta?.(inner);
               continue;
             }
             if (inner.type === "intent") {
