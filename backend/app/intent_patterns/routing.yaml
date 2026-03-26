@@ -63,6 +63,15 @@ structural_rules:
       - 'nộp\s+(hồ\s*sơ|đơn).{0,40}(ở\s+đâu|tại\s+đâu|qua\s+đâu)'
       - '(một\s*cửa|dịch\s*vụ\s*công|tthc|thủ\s*tục\s*hành\s*chính)'
       - '(đăng\s*ký|xin\s*phép|cấp\s*phép).{0,50}(lễ\s*hội|di\s*tích|tôn\s*giáo|biểu\s*diễn)'
+  # Trình tự / thủ tục thành lập, công nhận, đăng ký — patterns còn thiếu coverage
+  - intent_id: huong_dan_thu_tuc
+    priority: 91
+    confidence: 0.93
+    patterns:
+      - 'trình\s*tự\s+thủ\s*tục'
+      - 'thủ\s*tục\s+(thành\s*lập|đăng\s*ký\s+hoạt|cấp\s*phép\s+hoạt|đề\s*nghị\s+(được|cấp|công\s*nhận))'
+      - '(quy\s*trình|trình\s*tự).{0,50}(công\s*nhận|đề\s*nghị|thành\s*lập|đăng\s*ký\s+hoạt)'
+      - '(điều\s*kiện|tiêu\s*chuẩn).{0,60}(công\s*nhận|xếp\s*hạng|được\s+cấp\s+phép|đủ\s+điều\s*kiện\s+hoạt)'
   - intent_id: huong_dan_thu_tuc
     priority: 92
     confidence: 0.94
@@ -87,6 +96,8 @@ structural_rules:
     confidence: 0.95
     patterns:
       - '(tóm\s*tắt|tổng\s*hợp|khái\s*quát)\s+(nghị\s*định|luật|thông\s*tư|quyết\s*định|chỉ\s*thị)'
+      - 'tóm\s*tắt\s+(nội\s*dung|quy\s*định|văn\s*bản|các\s*quy\s*định|toàn\s*bộ)'
+      - 'tóm\s*tắt.{0,25}(nghị\s*định|thông\s*tư|quyết\s*định|chỉ\s*thị)'
 
   - intent_id: so_sanh_van_ban
     priority: 88
@@ -176,6 +187,10 @@ structural_rules:
     patterns:
       - '(xử\s*lý|xử\s*phạt).*(vi\s*phạm|trái\s*phép)'
       - '(bị\s*phạt|phạt\s*bao\s*nhiêu)'
+      # "bị xử phạt thế nào" / "bị xử lý thế nào" — phổ biến nhất trong data
+      - 'bị\s+(xử\s*phạt|xử\s*lý|phạt)\s*(thế\s*nào|như\s+thế\s+nào|ra\s+sao)?'
+      # "hành vi ... bị xử ..." / "áp dụng cho vi phạm nào"
+      - 'hành\s*vi.{0,80}(bị\s+xử\s*(phạt|lý)|vi\s*phạm\s+nào|áp\s*dụng\s+cho\s+vi\s*phạm)'
 
   - intent_id: hoa_giai_van_dong
     priority: 73
@@ -267,6 +282,9 @@ routing:
     - 'đăng\s+ký\s+.*(tổ\s+chức\s+)?lễ\s+hội'
     - 'kiểm\s+tra\s+.*cơ\s+sở\s+kinh\s+doanh'
     - 'vai\s+trò\s+của\s+ubnd'
+    - 'chính\s+sách.{0,100}(nhà\s+nước|quốc\s+gia|đối\s+với)'
+    - 'tiêu\s+ch[íi].{0,100}(phân\s+loại|dự\s+án|trọng\s+điểm)'
+    - 'dự\s+án\s+trọng\s+điểm\s+quốc\s+gia'
   consultation_advisory:
     - '\btham\s*mưu\b'
     - '\btư\s*vấn\b'
@@ -294,6 +312,9 @@ routing:
     - 'ban\s+hành\s+nghị\s*quyết'
   multi_article_boost_substantive:
     - 'mức\s+(xử\s+)?phạt|hành\s+vi\s+.*cấm|nghiêm\s+cấm|biện\s+pháp\s+phòng\s+ngừa'
+    - 'chính\s+sách.{0,100}(nhà\s+nước|quốc\s+gia|đối\s+với)'
+    - 'tiêu\s+ch[íi].{0,100}(phân\s+loại|dự\s+án|trọng\s+điểm)'
+    - 'dự\s+án\s+trọng\s+điểm\s+quốc\s+gia'
 
 # prototype_sentences: bổ sung biến thể câu cũ (merge nhóm đã gộp)
 prototype_sentences:

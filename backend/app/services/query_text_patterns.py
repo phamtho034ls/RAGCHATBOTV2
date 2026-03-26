@@ -149,6 +149,53 @@ def query_looks_procedural(query: str) -> bool:
     )
 
 
+def query_asks_comprehensive_statutory_coverage(query: str) -> bool:
+    """Chính sách / tiêu chí / phân loại — cần quét nhiều điều trong cùng luật hoặc văn bản hướng dẫn."""
+    q = (query or "").lower().strip()
+    if len(q) < 12:
+        return False
+    if re.search(r"chính\s+sách", q) and re.search(
+        r"(nhà\s+nước|quốc\s+gia|đối\s+với|của\s+nước)", q
+    ):
+        return True
+    if re.search(r"tiêu\s+ch[íi]", q) and re.search(
+        r"(phân\s+loại|dự\s+án|trọng\s+điểm|quốc\s+gia)", q
+    ):
+        return True
+    if "trọng điểm quốc gia" in q or "dự án trọng điểm quốc gia" in q:
+        return True
+    if "quyền và nghĩa vụ" in q or "nghĩa vụ và quyền" in q:
+        return True
+    return False
+
+
+def query_asks_structured_registration_conditions(query: str) -> bool:
+    """Câu hỏi về điều kiện đăng ký/thành lập/cấp phép/hoạt động — cần tách CSVC, hoạt động, nhân lực."""
+    q = (query or "").lower().strip()
+    if not q:
+        return False
+    if not re.search(r"\bđiều\s+kiện\b|\bđủ\s+điều\s+kiện\b|\byêu\s+cầu\b", q):
+        return False
+    if re.search(
+        r"đăng\s+ký|thành\s+lập|cấp\s+phép|hoạt\s+động|giấy\s+phép|"
+        r"thủ\s+tục|xin\s+phép|mở\s+cơ\s+sở|trợ\s+giúp\s+xã\s+hội|"
+        r"chứng\s+nhận\s+đủ\s+điều\s+kiện|kinh\s+doanh\s+có\s+điều\s+kiện",
+        q,
+    ):
+        return True
+    if re.search(
+        r"điều\s+kiện\s+(là\s+gì|gì|như\s+thế\s+nào|ra\s+sao|bao\s+gồm)",
+        q,
+    ):
+        return True
+    if re.search(
+        r"(cơ\s+sở\s+vật\s+chất|nhân\s+lực|trang\s+thiết\s+bị).{0,40}(yêu\s+cầu|điều\s+kiện|thế\s+nào)",
+        q,
+    ):
+        return True
+    return False
+
+
 def query_requests_prohibited_acts_list(query: str) -> bool:
     """Detect extraction/list queries about prohibited acts (requires multi-article)."""
     q = (query or "").lower().strip()

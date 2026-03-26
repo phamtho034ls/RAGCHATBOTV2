@@ -491,14 +491,17 @@ async def _handle_commune_level(
 ) -> Dict[str, Any]:
     """Handle commune-level administrative queries via the VHXH officer pipeline."""
     from app.services.rag_chain_v2 import _answer_commune_officer_query
+    from app.services.query_rewriter import rewrite_query
     from app.database.session import get_db_context
 
+    rewritten = await rewrite_query(question)
     async with get_db_context() as db:
         result = await _answer_commune_officer_query(
             query=question,
             db=db,
             temperature=temperature,
             doc_number=None,
+            retrieval_query=rewritten,
         )
     from app.services.rag_unified import sources_v2_to_legacy_copilot
 

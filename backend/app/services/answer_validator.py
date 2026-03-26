@@ -1,14 +1,33 @@
-"""Validate groundedness of generated answers against retrieved context."""
+"""Validate groundedness of generated answers against retrieved context.
+
+Two validation layers:
+  1. Embedding-based grounding check (``validate_answer_grounding``) — fast, no LLM call.
+  2. LLM-based semantic validation  (``validate_answer``)            — slower, deeper check.
+
+The LLM validator catches:
+  - Fabricated legal references not present in the retrieved context.
+  - Answers that contradict the context.
+  - Missing law citations when the context contains them.
+"""
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from app.config import ANSWER_VALIDATION_THRESHOLD
-from app.pipeline.embedding import embed_query, embed_texts
+from app.config import ANSWER_VALIDATION_THRESHOLD, OPENAI_API_KEY
+
+log = logging.getLogger(__name__)
+
+try:
+    from app.pipeline.embedding import embed_query, embed_texts
+except Exception:  # pragma: no cover – embedding may not be available in tests
+    embed_query = None  # type: ignore[assignment]
+    embed_texts = None  # type: ignore[assignment]
 
 
 def _normalize_answer(text: str) -> str:
@@ -121,7 +140,7 @@ def validate_answer_grounding(
     answer: str,
     context_docs: List[dict],
     threshold: float = ANSWER_VALIDATION_THRESHOLD,
-) -> Dict[str, float | bool]:
+) -> Dict:
     """Check whether answer semantically aligns with retrieved chunks.
 
     Nếu answer có chứa tham chiếu pháp luật (điều luật, tên văn bản),
@@ -164,3 +183,142 @@ def validate_answer_grounding(
         result["needs_regeneration"] = True
 
     return result
+
+
+# ── LLM-based answer validation ───────────────────────────────────────────────
+
+_VALIDATE_SYSTEM = (
+    "Bạn là chuyên gia kiểm tra chất lượng câu trả lời pháp lý Việt Nam. "
+    "Nhiệm vụ: xác minh câu trả lời có bám sát ngữ cảnh và không bịa đặt thông tin pháp lý. "
+    "Trả lời LUÔN LUÔN là JSON hợp lệ, không có markdown, không có giải thích bên ngoài JSON."
+)
+
+_VALIDATE_USER_TEMPLATE = """\
+Kiểm tra câu trả lời pháp lý sau dựa trên ngữ cảnh được cung cấp.
+
+CÂU HỎI:
+{query}
+
+NGỮ CẢNH (tài liệu đã truy xuất):
+{context}
+
+CÂU TRẢ LỜI CẦN KIỂM TRA:
+{answer}
+
+TIÊU CHÍ KIỂM TRA:
+1. Câu trả lời có bám sát nội dung ngữ cảnh không? (không bịa đặt thông tin)
+2. Số hiệu văn bản, số điều luật trong câu trả lời có tồn tại trong ngữ cảnh không?
+3. Câu trả lời có mâu thuẫn với nội dung ngữ cảnh không?
+4. Nếu ngữ cảnh có điều luật liên quan, câu trả lời có trích dẫn nguồn không?
+
+Trả lời theo định dạng JSON sau (không thêm bất cứ thứ gì ngoài JSON):
+{{
+  "is_valid": true hoặc false,
+  "confidence": số thực từ 0.0 đến 1.0,
+  "issues": ["danh sách vấn đề nếu có, để trống nếu hợp lệ"]
+}}\
+"""
+
+_FALLBACK_ANSWER = "Không đủ thông tin để trả lời chính xác dựa trên tài liệu hiện có."
+
+# Maximum context characters sent to the validator (keep cost/latency low)
+_MAX_CONTEXT_CHARS = 3000
+
+
+def _truncate_context_for_validation(context: str) -> str:
+    """Truncate context to avoid very large LLM calls during validation."""
+    if not context or len(context) <= _MAX_CONTEXT_CHARS:
+        return context
+    return context[:_MAX_CONTEXT_CHARS] + "\n...[ngữ cảnh đã rút gọn]"
+
+
+def _parse_validation_json(raw: str) -> Optional[Dict]:
+    """Extract and parse JSON from LLM output, tolerating minor formatting issues."""
+    raw = (raw or "").strip()
+    # Strip markdown code fences if present
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\s*```$", "", raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # Try to extract first {...} block
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group())
+            except json.JSONDecodeError:
+                pass
+    return None
+
+
+async def validate_answer(
+    query: str,
+    context: str,
+    answer: str,
+) -> Dict:
+    """LLM-based validation: check whether an answer is grounded in the context.
+
+    Catches hallucinated legal references, contradictions, and missing citations.
+
+    Args:
+        query:   The original user question.
+        context: The retrieved context string used to generate the answer.
+        answer:  The generated answer to validate.
+
+    Returns:
+        Dict with keys:
+          ``is_valid``   (bool)       – True when the answer passes all checks.
+          ``confidence`` (float 0–1)  – LLM's estimated confidence in the answer.
+          ``issues``     (List[str])  – List of detected issues (empty when valid).
+
+        On any LLM error, returns a permissive default so the pipeline is not blocked.
+    """
+    _safe_default: Dict = {"is_valid": True, "confidence": 0.5, "issues": []}
+
+    if not OPENAI_API_KEY:
+        return _safe_default
+
+    if not answer or not context:
+        return {"is_valid": False, "confidence": 0.0, "issues": ["Thiếu câu trả lời hoặc ngữ cảnh"]}
+
+    try:
+        from app.services.llm_client import generate
+
+        prompt = _VALIDATE_USER_TEMPLATE.format(
+            query=(query or "").strip(),
+            context=_truncate_context_for_validation(context),
+            answer=(answer or "").strip()[:2000],
+        )
+        raw: str = await generate(
+            prompt=prompt,
+            system=_VALIDATE_SYSTEM,
+            temperature=0.0,
+            max_tokens=300,
+        )
+
+        parsed = _parse_validation_json(raw)
+        if parsed is None:
+            log.warning("validate_answer: could not parse LLM JSON response — defaulting to valid")
+            return _safe_default
+
+        result: Dict = {
+            "is_valid": bool(parsed.get("is_valid", True)),
+            "confidence": float(parsed.get("confidence", 0.5)),
+            "issues": list(parsed.get("issues", [])),
+        }
+        log.info(
+            "LLM answer validation | is_valid=%s confidence=%.2f issues=%s",
+            result["is_valid"],
+            result["confidence"],
+            result["issues"],
+        )
+        return result
+
+    except Exception as exc:
+        log.warning("validate_answer failed (allowing answer through): %s", exc)
+        return _safe_default
+
+
+def get_fallback_answer() -> str:
+    """Standard fallback answer returned when validation fails and regeneration is skipped."""
+    return _FALLBACK_ANSWER

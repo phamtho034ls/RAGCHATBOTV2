@@ -6,6 +6,7 @@ Nhóm pattern checklist / multi-doc / substantive / consultation đọc từ
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict
 
 from app.services.intent_detector import (
@@ -59,6 +60,35 @@ def map_detector_to_routing_intent(det: str) -> str:
     if det in VALID_INTENTS:
         return det
     return "legal_lookup"
+
+
+def _force_multi_article_for_comprehensive_statutory_queries(
+    query: str, flags: Dict[str, bool]
+) -> None:
+    """Chính sách, tiêu chí dự án, thư viện + điều kiện — cần multi-query + nhiều điều."""
+    q = (query or "").lower().strip()
+    if len(q) < 10:
+        return
+
+    if re.search(r"chính\s+sách", q) and re.search(
+        r"(nhà\s+nước|quốc\s+gia|đối\s+với)", q
+    ):
+        flags["needs_expansion"] = True
+        flags["use_multi_article"] = True
+        return
+    if re.search(r"tiêu\s+ch[íi]", q) and re.search(
+        r"(phân\s+loại|dự\s+án|trọng\s+điểm)", q
+    ):
+        flags["needs_expansion"] = True
+        flags["use_multi_article"] = True
+        return
+    if "trọng điểm quốc gia" in q or "dự án trọng điểm quốc gia" in q:
+        flags["needs_expansion"] = True
+        flags["use_multi_article"] = True
+        return
+    if "thư viện công" in q and ("là gì" in q or "điều kiện" in q):
+        flags["needs_expansion"] = True
+        flags["use_multi_article"] = True
 
 
 def _narrow_multi_article_boost(query: str, flags: Dict[str, bool]) -> None:
@@ -145,6 +175,7 @@ def compute_intent_bundle(query: str) -> Dict[str, Any]:
         ):
             flags["use_multi_article"] = True
     _sync_lookup_and_multi_article(det, flags)
+    _force_multi_article_for_comprehensive_statutory_queries(raw_q, flags)
     return {
         "detector_intent": det,
         "detector_confidence": conf,

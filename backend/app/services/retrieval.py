@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy import func, select, or_
 
-from app.config import QUERY_REWRITE_PROMPT, RETRIEVAL_TOP_K
+from app.config import RETRIEVAL_TOP_K
 from app.database.models import Document, VectorChunk
 from app.database.session import _session_factory
 from app.retrieval.hybrid_retriever import hybrid_search
@@ -212,14 +212,6 @@ def format_sources(docs: List[dict]) -> List[dict]:
 
 
 async def rewrite_query(question: str) -> str:
-    """Rewrite a query for better retrieval."""
-    from app.services.llm_client import generate
-
-    try:
-        prompt = QUERY_REWRITE_PROMPT.format(question=question)
-        rewritten = (await generate(prompt, temperature=0.0)).strip()
-        if rewritten and len(rewritten) > 5:
-            return rewritten
-    except Exception:
-        pass
-    return question
+    """Rewrite a query — delegates to the canonical query_rewriter module."""
+    from app.services.query_rewriter import rewrite_query as _rewrite
+    return await _rewrite(question)
