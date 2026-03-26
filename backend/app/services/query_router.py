@@ -9,7 +9,7 @@ Pipeline:
     → Trả response
 
 Routing rules:
-    tra_cuu_van_ban     → RAG pipeline (enhanced)
+    tra_cuu_van_ban     → ``rag_query_unified`` (``rag_chain_v2``)
     huong_dan_thu_tuc   → Procedure knowledge base + RAG
     kiem_tra_ho_so      → Document checker
     tom_tat_van_ban     → Document summarizer + RAG
@@ -24,7 +24,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
-from app.services.intent_detector import detect_intent
+from app.config import OUT_OF_SCOPE_USER_MESSAGE
+from app.services.intent_detector import VALID_INTENTS, detect_intent, normalize_legacy_intent
 
 log = logging.getLogger(__name__)
 
@@ -35,20 +36,49 @@ async def route_query(
     dataset_id: Optional[str] = None,
     intent_override: Optional[Dict[str, Any]] = None,
     conversation_id: Optional[str] = None,
+    utterance_labels: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Phân tích intent và điều phối đến pipeline xử lý phù hợp."""
     # 1. Nhận diện intent (dùng override nếu đã detect trước)
-    intent_result = intent_override or await detect_intent(question)
-    intent = intent_result["intent"]
+    intent_result = dict(intent_override or await detect_intent(question))
+    raw_intent = str(intent_result.get("intent", "hoi_dap_chung"))
+    intent = normalize_legacy_intent(raw_intent)
+    if intent == "nan":
+        log.info("Router: intent=nan (OOS), short-circuit")
+        return {
+            "answer": OUT_OF_SCOPE_USER_MESSAGE,
+            "sources": [],
+            "metadata": {"pipeline": "out_of_scope"},
+            "intent": {**intent_result, "intent": "nan"},
+        }
+    if intent not in VALID_INTENTS:
+        intent = "hoi_dap_chung"
+    intent_result["intent"] = intent
     log.info("Router: intent=%s, routing to handler...", intent)
 
     # 2. Dispatch đến handler phù hợp dựa trên intent
     handler = ROUTE_MAP.get(intent, _handle_hoi_dap_chung)
-    result = await handler(question, temperature, dataset_id)
+    result = await handler(
+        question, temperature, dataset_id, conversation_id, utterance_labels
+    )
 
     # 3. Gắn intent vào response
     result["intent"] = intent_result
     return result
+
+
+async def _handle_out_of_scope(
+    question: str,
+    temperature: float,
+    dataset_id: Optional[str],
+    conversation_id: Optional[str] = None,
+    utterance_labels: Optional[Any] = None,
+) -> Dict[str, Any]:
+    return {
+        "answer": OUT_OF_SCOPE_USER_MESSAGE,
+        "sources": [],
+        "metadata": {"pipeline": "out_of_scope"},
+    }
 
 
 # ── Route Handlers ──────────────────────────────────────────
@@ -57,15 +87,25 @@ async def _handle_tra_cuu_van_ban(
     question: str,
     temperature: float,
     dataset_id: Optional[str],
+    conversation_id: Optional[str] = None,
+    utterance_labels: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Tra cứu văn bản pháp luật qua RAG pipeline nâng cao."""
-    from app.services.rag_chain import rag_query_enhanced
+    """Tra cứu văn bản pháp luật — ``rag_chain_v2`` thống nhất."""
+    from app.database.session import get_db_context
+    from app.services.rag_unified import rag_query_unified
 
-    result = await rag_query_enhanced(question, temperature=temperature)
+    async with get_db_context() as db:
+        result = await rag_query_unified(
+            question,
+            db,
+            temperature=temperature,
+            conversation_id=conversation_id,
+            utterance_labels=utterance_labels,
+        )
     return {
         "answer": result["answer"],
         "sources": result["sources"],
-        "metadata": {"pipeline": "rag_enhanced", "query_analysis": result.get("query_analysis")},
+        "metadata": {"pipeline": "rag_v2_unified", "query_analysis": result.get("query_analysis")},
     }
 
 
@@ -73,16 +113,25 @@ async def _handle_huong_dan_thu_tuc(
     question: str,
     temperature: float,
     dataset_id: Optional[str],
+    conversation_id: Optional[str] = None,
+    utterance_labels: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Hướng dẫn thủ tục hành chính: tìm procedure + bổ sung RAG."""
+    from app.database.session import get_db_context
     from app.services.procedure_service import search_procedure
-    from app.services.rag_chain import rag_query_enhanced
+    from app.services.rag_unified import rag_query_unified
 
     # Tìm thủ tục phù hợp từ knowledge base
     procedure_result = search_procedure(question)
 
-    # Bổ sung context từ RAG
-    rag_result = await rag_query_enhanced(question, temperature=temperature, top_k=4)
+    async with get_db_context() as db:
+        rag_result = await rag_query_unified(
+            question,
+            db,
+            temperature=temperature,
+            conversation_id=conversation_id,
+            utterance_labels=utterance_labels,
+        )
 
     if procedure_result:
         # Format thông tin thủ tục
@@ -127,6 +176,8 @@ async def _handle_kiem_tra_ho_so(
     question: str,
     temperature: float,
     dataset_id: Optional[str],
+    conversation_id: Optional[str] = None,
+    utterance_labels: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Kiểm tra hồ sơ: parse danh sách giấy tờ và kiểm tra thiếu/đủ."""
     from app.services.document_checker import check_documents_from_query
@@ -152,6 +203,8 @@ async def _handle_tom_tat_van_ban(
     question: str,
     temperature: float,
     dataset_id: Optional[str],
+    conversation_id: Optional[str] = None,
+    utterance_labels: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Tóm tắt văn bản pháp luật – ưu tiên danh sách điều luật từ DB."""
     from app.services.document_summarizer import list_document_articles, summarize_document
@@ -176,6 +229,8 @@ async def _handle_so_sanh_van_ban(
     question: str,
     temperature: float,
     dataset_id: Optional[str],
+    conversation_id: Optional[str] = None,
+    utterance_labels: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """So sánh hai văn bản pháp luật."""
     from app.services.document_comparator import compare_documents
@@ -192,6 +247,8 @@ async def _handle_tao_bao_cao(
     question: str,
     temperature: float,
     dataset_id: Optional[str],
+    conversation_id: Optional[str] = None,
+    utterance_labels: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Tạo báo cáo hành chính."""
     from app.services.report_generator import generate_report
@@ -208,15 +265,25 @@ async def _handle_hoi_dap_chung(
     question: str,
     temperature: float,
     dataset_id: Optional[str],
+    conversation_id: Optional[str] = None,
+    utterance_labels: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Hỏi đáp chung qua RAG pipeline."""
-    from app.services.rag_chain import rag_query_enhanced
+    """Hỏi đáp chung — RAG v2 thống nhất."""
+    from app.database.session import get_db_context
+    from app.services.rag_unified import rag_query_unified
 
-    result = await rag_query_enhanced(question, temperature=temperature)
+    async with get_db_context() as db:
+        result = await rag_query_unified(
+            question,
+            db,
+            temperature=temperature,
+            conversation_id=conversation_id,
+            utterance_labels=utterance_labels,
+        )
     return {
         "answer": result["answer"],
         "sources": result["sources"],
-        "metadata": {"pipeline": "rag_general"},
+        "metadata": {"pipeline": "rag_v2_unified"},
     }
 
 
@@ -246,6 +313,8 @@ async def _handle_soan_thao_van_ban(
     question: str,
     temperature: float,
     dataset_id: Optional[str],
+    conversation_id: Optional[str] = None,
+    utterance_labels: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Soạn thảo văn bản hành chính."""
     from app.tools.draft_tool import run as draft_run
@@ -262,6 +331,8 @@ async def _handle_trich_xuat_van_ban(
     question: str,
     temperature: float,
     dataset_id: Optional[str],
+    conversation_id: Optional[str] = None,
+    utterance_labels: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Trích xuất thông tin/quy định cụ thể từ văn bản pháp luật."""
     from app.tools.extract_tool import run as extract_run
@@ -278,11 +349,21 @@ async def _handle_can_cu_phap_ly(
     question: str,
     temperature: float,
     dataset_id: Optional[str],
+    conversation_id: Optional[str] = None,
+    utterance_labels: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Xác định căn cứ pháp lý cho văn bản/quy định."""
-    from app.services.rag_chain import rag_query_enhanced
+    """Xác định căn cứ pháp lý — RAG v2 thống nhất."""
+    from app.database.session import get_db_context
+    from app.services.rag_unified import rag_query_unified
 
-    result = await rag_query_enhanced(question, temperature=temperature, top_k=10)
+    async with get_db_context() as db:
+        result = await rag_query_unified(
+            question,
+            db,
+            temperature=temperature,
+            conversation_id=conversation_id,
+            utterance_labels=utterance_labels,
+        )
     return {
         "answer": result["answer"],
         "sources": result["sources"],
@@ -294,11 +375,21 @@ async def _handle_giai_thich_quy_dinh(
     question: str,
     temperature: float,
     dataset_id: Optional[str],
+    conversation_id: Optional[str] = None,
+    utterance_labels: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Giải thích quy định pháp luật."""
-    from app.services.rag_chain import rag_query_enhanced
+    """Giải thích quy định pháp luật — RAG v2 thống nhất."""
+    from app.database.session import get_db_context
+    from app.services.rag_unified import rag_query_unified
 
-    result = await rag_query_enhanced(question, temperature=temperature, top_k=8)
+    async with get_db_context() as db:
+        result = await rag_query_unified(
+            question,
+            db,
+            temperature=temperature,
+            conversation_id=conversation_id,
+            utterance_labels=utterance_labels,
+        )
     return {
         "answer": result["answer"],
         "sources": result["sources"],
@@ -310,6 +401,8 @@ async def _handle_admin_planning(
     question: str,
     temperature: float,
     dataset_id: Optional[str],
+    conversation_id: Optional[str] = None,
+    utterance_labels: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Xử lý câu hỏi quy hoạch/quản lý hành chính – quy trình đa bước.
 
@@ -318,8 +411,9 @@ async def _handle_admin_planning(
         2. Retrieve legal regulations via RAG
         3. Combine contexts → LLM multi-step reasoning
     """
+    from app.database.session import get_db_context
     from app.services.local_data_service import lookup_local_data, extract_location
-    from app.services.rag_chain import rag_query_enhanced
+    from app.services.rag_unified import rag_query_unified
     from app.services.llm_client import generate
     from app.config import COPILOT_SYSTEM_PROMPT, ADMIN_PLANNING_PROMPT
 
@@ -334,8 +428,14 @@ async def _handle_admin_planning(
         log.info("[ADMIN_PLANNING] location=%s, local_data_len=%d",
                  location, len(local_data))
 
-    # Step 3: Retrieve legal regulations
-    rag_result = await rag_query_enhanced(question, temperature=temperature, top_k=10)
+    async with get_db_context() as db:
+        rag_result = await rag_query_unified(
+            question,
+            db,
+            temperature=temperature,
+            conversation_id=conversation_id,
+            utterance_labels=utterance_labels,
+        )
     legal_parts: list[str] = []
     for s in rag_result.get("sources", []):
         meta = s.get("metadata", {}) or {}
@@ -386,6 +486,8 @@ async def _handle_commune_level(
     question: str,
     temperature: float,
     dataset_id: Optional[str],
+    conversation_id: Optional[str] = None,
+    utterance_labels: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Handle commune-level administrative queries via the VHXH officer pipeline."""
     from app.services.rag_chain_v2 import _answer_commune_officer_query
@@ -398,9 +500,11 @@ async def _handle_commune_level(
             temperature=temperature,
             doc_number=None,
         )
+    from app.services.rag_unified import sources_v2_to_legacy_copilot
+
     return {
         "answer": result.get("answer", ""),
-        "sources": result.get("sources", []),
+        "sources": sources_v2_to_legacy_copilot(result.get("sources", []) or []),
         "metadata": {"pipeline": "commune_officer"},
     }
 
@@ -409,6 +513,8 @@ async def _handle_ninh_binh_info(
     question: str,
     temperature: float,
     dataset_id: Optional[str],
+    conversation_id: Optional[str] = None,
+    utterance_labels: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Tra cứu thông tin chung về tỉnh Ninh Bình (phi pháp lý)."""
     from app.tools.ninh_binh_search_tool import run as ninh_binh_run
@@ -435,13 +541,13 @@ ROUTE_MAP = {
     "tao_bao_cao": _handle_tao_bao_cao,
     "soan_thao_van_ban": _handle_soan_thao_van_ban,
     "trich_xuat_van_ban": _handle_trich_xuat_van_ban,
+    "document_meta_relation": _handle_tra_cuu_van_ban,
+    "article_query": _handle_tra_cuu_van_ban,
+    "out_of_scope": _handle_out_of_scope,
     # Commune-level intents → VHXH officer pipeline
     "xu_ly_vi_pham_hanh_chinh": _handle_commune_level,
     "kiem_tra_thanh_tra": _handle_commune_level,
-    "thu_tuc_hanh_chinh": _handle_commune_level,
     "hoa_giai_van_dong": _handle_commune_level,
-    "bao_ve_xa_hoi": _handle_commune_level,
     "to_chuc_su_kien_cong": _handle_commune_level,
-    "bao_ton_phat_trien": _handle_commune_level,
     "hoi_dap_chung": _handle_hoi_dap_chung,
 }

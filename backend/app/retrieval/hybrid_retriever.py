@@ -6,12 +6,23 @@ import logging
 import re
 import unicodedata
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import select, func
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import MULTI_ARTICLE_MAX_ARTICLES, RERANK_TOP_K, RETRIEVAL_TOP_K
+from app.config import (
+    MULTI_ARTICLE_MAX_ARTICLES,
+    RAG_AMENDMENT_FULL_DOC_EXPAND,
+    RAG_AMENDMENT_MAX_ARTICLES,
+    RAG_AMENDMENT_MAX_CHUNKS,
+    RERANK_TOP_K,
+    RETRIEVAL_TOP_K,
+    TOPIC_MISMATCH_PENALTY,
+    TOPIC_MISMATCH_QUERY_CONF_MIN,
+)
+from app.services.domain_classifier import classify_query_domain
 from app.database.models import VectorChunk, Document, Article, Clause, Chapter, Section
 from app.retrieval.article_lookup import lookup_article_from_db
 from app.retrieval.keyword_retriever import keyword_search
@@ -20,6 +31,224 @@ from app.retrieval.vector_retriever import vector_search
 from app.retrieval.article_selection import diversify_by_article, dynamic_max_articles
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Văn bản sửa đổi / bổ sung — lấy đủ Điều trong DB
+# ---------------------------------------------------------------------------
+
+_AMEND_DOC_TITLE_RE = re.compile(
+    r"sửa\s*đổi\s*,?\s*bổ\s*sung|bổ\s*sung\s*,?\s*sửa\s*đổi|"
+    r"một\s*số\s*điều\s*(?:của|các\s*luật|các\s*nghị\s*định)|"
+    r"một\s*số\s*điều\s*khoản\s*của|"
+    r"(?:luật|nghị\s*định|thông\s*tư|quyết\s*định)\s+"
+    r"(?:số\s*)?(?:sửa\s*đổi|sửa\s*đổi\s*,?\s*bổ\s*sung|bổ\s*sung)|"
+    r"đính\s*chính",
+    re.IGNORECASE,
+)
+
+_AMEND_QUERY_HINT_RE = re.compile(
+    r"sửa\s*đổi|bổ\s*sung|thay\s*thế|đính\s*chính|"
+    r"những\s*điều\s*(?:được\s*)?(?:sửa|bổ\s*sung|thay)|"
+    r"điều\s*nào\s*(?:được\s*)?(?:sửa|bổ\s*sung|thay)|"
+    r"nội\s*dung\s*(?:các\s*)?(?:thay\s*đổi|sửa\s*đổi)",
+    re.IGNORECASE,
+)
+
+
+def _passage_or_doc_title_hints_amendment(p: Dict) -> bool:
+    t = f"{p.get('document_title') or ''} {p.get('doc_number') or ''}"
+    return bool(_AMEND_DOC_TITLE_RE.search(t))
+
+
+def _document_title_str_hints_amendment(title: Optional[str]) -> bool:
+    return bool(_AMEND_DOC_TITLE_RE.search(title or ""))
+
+
+def _query_hints_amendment_scope(query: str) -> bool:
+    return bool(_AMEND_QUERY_HINT_RE.search(query or ""))
+
+
+async def _list_article_ids_for_documents(
+    db: AsyncSession,
+    doc_ids: List[int],
+    max_articles: int,
+) -> List[int]:
+    """Chia quota đều mỗi văn bản để không một luật sửa đổi nuốt hết limit."""
+    if not doc_ids or max_articles <= 0:
+        return []
+    uniq = list(dict.fromkeys(int(d) for d in doc_ids))
+    per_doc = max(1, max_articles // len(uniq))
+    all_ids: List[int] = []
+    for did in uniq:
+        stmt = (
+            select(Article.id)
+            .where(Article.document_id == did)
+            .order_by(Article.id)
+            .limit(per_doc)
+        )
+        all_ids.extend([r[0] for r in (await db.execute(stmt)).all()])
+    if len(all_ids) > max_articles:
+        all_ids = all_ids[:max_articles]
+    return all_ids
+
+
+def _synthetic_chunks_from_article_rows(
+    rows: List[Any],
+    base_rerank: float,
+) -> Dict[int, List[Dict]]:
+    """Một passage/điều khi chưa có VectorChunk."""
+    out: Dict[int, List[Dict]] = {}
+    for row in rows:
+        aid = int(row.id)
+        anum = _normalize_article_number(row.article_number) or str(row.article_number or "").strip()
+        title = (row.title or "").strip()
+        dn = row.doc_number or ""
+        dtitle = (getattr(row, "document_title", None) or "").strip()
+        header = f"{dtitle}\nĐiều {anum}"
+        if title:
+            header += f". {title}"
+        text_chunk = f"{header}\n{(row.content or '').strip()}"
+        out[aid] = [{
+            "id": f"db_{aid}",
+            "score": base_rerank,
+            "text_chunk": text_chunk,
+            "document_id": row.document_id,
+            "article_id": aid,
+            "clause_id": None,
+            "doc_number": dn,
+            "document_title": dtitle,
+            "article_number": anum,
+            "article_title": title,
+            "clause_number": None,
+            "chapter": "",
+            "section": "",
+            "rerank_score": base_rerank,
+            "_full_article": True,
+            "_db_lookup": True,
+        }]
+    return out
+
+
+async def _flatten_chunks_for_article_ids(
+    db: AsyncSession,
+    article_ids: List[int],
+    base_rerank: float,
+) -> List[Dict]:
+    if not article_ids:
+        return []
+    chunk_map = await _fetch_full_article_chunks(db, article_ids)
+    missing = [aid for aid in article_ids if not chunk_map.get(aid)]
+    if missing:
+        stmt = (
+            select(
+                Article.id,
+                Article.document_id,
+                Article.article_number,
+                Article.title,
+                Article.content,
+                Document.doc_number,
+                Document.title.label("document_title"),
+            )
+            .join(Document, Article.document_id == Document.id)
+            .where(Article.id.in_(missing))
+        )
+        synth_rows = (await db.execute(stmt)).all()
+        chunk_map.update(_synthetic_chunks_from_article_rows(synth_rows, base_rerank))
+    passages: List[Dict] = []
+    for aid in article_ids:
+        for ch in chunk_map.get(aid) or []:
+            ch.setdefault("rerank_score", base_rerank)
+            passages.append(ch)
+    return passages
+
+
+async def _fetch_all_passages_for_documents(
+    db: AsyncSession,
+    doc_ids: List[int],
+    max_articles: int,
+    base_rerank: float,
+) -> List[Dict]:
+    article_ids = await _list_article_ids_for_documents(db, doc_ids, max_articles)
+    return await _flatten_chunks_for_article_ids(db, article_ids, base_rerank)
+
+
+def _collect_amendment_expand_document_ids(
+    passages: List[Dict],
+    query: str,
+    scan_limit: int = 40,
+) -> List[int]:
+    out: List[int] = []
+    seen: set = set()
+    q_amend = _query_hints_amendment_scope(query)
+    for p in passages[:scan_limit]:
+        if not (q_amend or _passage_or_doc_title_hints_amendment(p)):
+            continue
+        did = p.get("document_id")
+        if did is None:
+            continue
+        try:
+            i = int(did)
+        except (TypeError, ValueError):
+            continue
+        if i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out
+
+
+async def _merge_amendment_expanded_passages(
+    db: AsyncSession,
+    snapshot_before_collapse: List[Dict],
+    collapsed: List[Dict],
+    query: str,
+) -> List[Dict]:
+    if not RAG_AMENDMENT_FULL_DOC_EXPAND or not snapshot_before_collapse:
+        return collapsed
+    doc_ids = _collect_amendment_expand_document_ids(snapshot_before_collapse, query)
+    if not doc_ids:
+        return collapsed
+    max_score = max(
+        (
+            float(p.get("rerank_score", p.get("rrf_score", p.get("score", 0.0))))
+            for p in snapshot_before_collapse
+        ),
+        default=0.55,
+    )
+    base = max_score * 0.98
+    expanded = await _fetch_all_passages_for_documents(
+        db, doc_ids, RAG_AMENDMENT_MAX_ARTICLES, base
+    )
+    if not expanded:
+        return collapsed
+    doc_set = set(doc_ids)
+    tail = [p for p in collapsed if p.get("document_id") not in doc_set]
+    seen_article: set = set()
+    merged: List[Dict] = []
+    for p in expanded:
+        aid = p.get("article_id")
+        if aid:
+            if aid in seen_article:
+                continue
+            seen_article.add(aid)
+        merged.append(p)
+    for p in tail:
+        aid = p.get("article_id")
+        if aid and aid in seen_article:
+            continue
+        merged.append(p)
+        if aid:
+            seen_article.add(aid)
+    cap = max(RAG_AMENDMENT_MAX_CHUNKS, 1)
+    if len(merged) > cap:
+        merged = merged[:cap]
+    log.info(
+        "Amendment expand: doc_ids=%s expanded=%d merged=%d",
+        doc_ids,
+        len(expanded),
+        len(merged),
+    )
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -122,13 +351,31 @@ async def _resolve_doc_number(db: AsyncSession, raw_ref: str) -> Optional[str]:
         num, year = m.group(1), m.group(2)
         for sep in ["/", "_"]:
             prefix = f"{num}{sep}{year}"
-            stmt = select(Document.doc_number).where(
-                Document.doc_number.like(f"{prefix}%")
-            ).limit(1)
-            row = (await db.execute(stmt)).scalar()
-            if row:
-                log.info("[RESOLVE] '%s' → '%s' (prefix '%s')", raw_ref, row, prefix)
-                return row
+            stmt = (
+                select(Document.doc_number)
+                .where(Document.doc_number.like(f"{prefix}%"))
+                .order_by(Document.doc_number)
+                .limit(24)
+            )
+            rows = list((await db.execute(stmt)).scalars().all())
+            if not rows:
+                continue
+            raw_norm = _normalize_doc_ref(raw_ref)
+            for cand in rows:
+                if _normalize_doc_ref(cand) == raw_norm or raw_ref in cand or cand in raw_ref:
+                    log.info("[RESOLVE] '%s' → '%s' (prefix '%s')", raw_ref, cand, prefix)
+                    return cand
+            # Một số DB có nhiều bản ghi cùng prefix — chọn bản có độ dài ổn định, tên khớp raw_ref hơn
+            best = min(
+                rows,
+                key=lambda d: (
+                    0 if raw_norm and raw_norm in _normalize_doc_ref(d) else 1,
+                    abs(len(d) - len(raw_ref)),
+                    d,
+                ),
+            )
+            log.info("[RESOLVE] '%s' → '%s' (prefix '%s', disambiguated)", raw_ref, best, prefix)
+            return best
 
     log.warning("[RESOLVE] Could not resolve doc_number '%s'", raw_ref)
     return raw_ref
@@ -262,14 +509,58 @@ async def _fetch_full_article_chunks(
     return article_chunks
 
 
+def _doc_topic_labels(item: Dict) -> set:
+    """Domains associated with a passage (Qdrant payload + DB fallback)."""
+    raw = item.get("law_intents")
+    if isinstance(raw, list) and raw:
+        return {str(x) for x in raw if x and str(x) != "chung"}
+    dom = item.get("legal_domain")
+    if dom and dom != "chung":
+        return {str(dom)}
+    return set()
+
+
+def _apply_topic_mismatch_penalty(query: str, reranked: List[Dict]) -> None:
+    """Lower rerank_score when query domains (from classifier) do not overlap document tags."""
+    if not query or not query.strip() or not reranked:
+        return
+    q_hits = classify_query_domain(query.strip(), top_n=4)
+    q_set = {
+        d["domain"]
+        for d in q_hits
+        if d.get("domain") and d["domain"] != "chung"
+        and float(d.get("confidence") or 0) >= TOPIC_MISMATCH_QUERY_CONF_MIN
+    }
+    if not q_set:
+        return
+
+    n = 0
+    for item in reranked:
+        doc_set = _doc_topic_labels(item)
+        if not doc_set:
+            continue
+        if q_set & doc_set:
+            continue
+        prev = float(item.get("rerank_score", 0.0))
+        item["rerank_score"] = float(prev - TOPIC_MISMATCH_PENALTY)
+        item["topic_mismatch_penalty"] = True
+        n += 1
+    if n:
+        reranked.sort(key=lambda x: float(x.get("rerank_score", 0.0)), reverse=True)
+        log.info(
+            "Topic mismatch penalty applied to %d/%d passages (query_domains=%s, penalty=%.2f)",
+            n, len(reranked), list(q_set), TOPIC_MISMATCH_PENALTY,
+        )
+
+
 async def _enrich_missing_metadata(db: AsyncSession, items: List[Dict]) -> None:
     """Fill article/document metadata for old vectors missing payload fields."""
     article_ids = {item.get("article_id") for item in items if item.get("article_id")}
     if not article_ids:
         return
 
-    stmt = (
-        select(
+    def _article_enrich_select(include_law_intents: bool):
+        cols = [
             Article.id.label("article_id"),
             Article.article_number,
             Article.title.label("article_title"),
@@ -282,13 +573,30 @@ async def _enrich_missing_metadata(db: AsyncSession, items: List[Dict]) -> None:
             Chapter.title.label("chapter_title"),
             Section.section_number,
             Section.title.label("section_title"),
+        ]
+        if include_law_intents:
+            cols.insert(8, Document.law_intents)
+        return (
+            select(*cols)
+            .join(Document, Article.document_id == Document.id)
+            .outerjoin(Chapter, Article.chapter_id == Chapter.id)
+            .outerjoin(Section, Article.section_id == Section.id)
+            .where(Article.id.in_(article_ids))
         )
-        .join(Document, Article.document_id == Document.id)
-        .outerjoin(Chapter, Article.chapter_id == Chapter.id)
-        .outerjoin(Section, Article.section_id == Section.id)
-        .where(Article.id.in_(article_ids))
-    )
-    result = await db.execute(stmt)
+
+    stmt = _article_enrich_select(include_law_intents=True)
+    try:
+        result = await db.execute(stmt)
+    except ProgrammingError as exc:
+        if "law_intents" not in str(getattr(exc, "orig", None) or exc):
+            raise
+        log.warning(
+            "DB missing documents.law_intents — run: cd backend && alembic upgrade head. "
+            "Continuing without law_intents from DB.",
+        )
+        # PG aborts the transaction on error; must rollback before any further SQL on this session.
+        await db.rollback()
+        result = await db.execute(_article_enrich_select(include_law_intents=False))
     mapping = {row.article_id: row for row in result.all()}
 
     def _fmt_date(d) -> str:
@@ -310,6 +618,8 @@ async def _enrich_missing_metadata(db: AsyncSession, items: List[Dict]) -> None:
         item["article_title"] = item.get("article_title") or row.article_title or ""
         item["doc_number"] = item.get("doc_number") or row.doc_number or ""
         item["document_title"] = item.get("document_title") or row.document_title or ""
+        if item.get("law_intents") is None and getattr(row, "law_intents", None) is not None:
+            item["law_intents"] = row.law_intents
         if getattr(row, "effective_date", None) is not None:
             item["effective_date"] = _fmt_date(row.effective_date)
         if getattr(row, "issued_date", None) is not None:
@@ -323,6 +633,27 @@ async def _enrich_missing_metadata(db: AsyncSession, items: List[Dict]) -> None:
         stitle = getattr(row, "section_title", None) or ""
         if snum:
             item.setdefault("section", f"Mục {snum} - {stitle}" if stitle.strip() else f"Mục {snum}")
+
+    doc_ids = {
+        item.get("document_id")
+        for item in items
+        if item.get("document_id") and item.get("law_intents") is None
+    }
+    if doc_ids:
+        stmt_doc = select(Document.id, Document.law_intents).where(Document.id.in_(doc_ids))
+        try:
+            by_doc = {r.id: r.law_intents for r in (await db.execute(stmt_doc)).all()}
+        except ProgrammingError as exc:
+            if "law_intents" not in str(getattr(exc, "orig", None) or exc):
+                raise
+            await db.rollback()
+            by_doc = {}
+        for item in items:
+            did = item.get("document_id")
+            if did and item.get("law_intents") is None:
+                li = by_doc.get(did)
+                if li:
+                    item["law_intents"] = li
 
 
 def _group_key(item: Dict) -> Optional[Tuple[Optional[int], str]]:
@@ -416,15 +747,36 @@ async def _direct_article_lookup(
     articles by title similarity or explicit article number, then returns
     all chunks from the best-matching article.
     For summary queries (tóm tắt, nội dung), returns all articles.
+    Văn bản sửa đổi/bổ sung (theo tiêu đề) → trả về tất cả Điều (giới hạn cấu hình).
     """
     stmt = (
-        select(Article.id, Article.article_number, Article.title, Document.id.label("document_id"))
+        select(
+            Article.id,
+            Article.article_number,
+            Article.title,
+            Document.id.label("document_id"),
+            Document.title.label("document_title"),
+        )
         .join(Document, Article.document_id == Document.id)
         .where(Document.doc_number == resolved_doc_number)
     )
     rows = (await db.execute(stmt)).all()
     if not rows:
         return []
+
+    doc_title = (getattr(rows[0], "document_title", None) or "") or ""
+    if (
+        RAG_AMENDMENT_FULL_DOC_EXPAND
+        and _document_title_str_hints_amendment(doc_title)
+    ):
+        lim = min(len(rows), RAG_AMENDMENT_MAX_ARTICLES)
+        all_ids = [r.id for r in rows[:lim]]
+        log.info(
+            "[DIRECT] Văn bản sửa đổi/bổ sung (tiêu đề) → %d điều cho '%s'",
+            len(all_ids),
+            resolved_doc_number,
+        )
+        return await _flatten_chunks_for_article_ids(db, all_ids, 0.88)
 
     if explicit_article:
         for row in rows:
@@ -548,13 +900,26 @@ async def hybrid_search(
     )
 
     # ── 2b. Fallback: if filtered search returned too few results, retry without filters
+    # Không bỏ lọc số hiệu khi người dùng nêu rõ văn bản — tránh kéo nhầm NĐ/luật khác (vd. 137 vs 138).
     if (resolved_doc_number or legal_domains) and (len(vector_results) + len(keyword_results)) < 3:
-        log.info(
-            "Filtered search too few results (%d+%d), retrying unfiltered (domains=%s, doc=%s)",
-            len(vector_results), len(keyword_results), legal_domains, resolved_doc_number,
-        )
-        vector_results = vector_search(query=query, top_k=fetch_k, document_id=document_id)
-        keyword_results = await keyword_search(query=query, db=db, top_k=fetch_k)
+        if explicit_doc_ref:
+            log.info(
+                "Filtered search few results (%d+%d) but explicit doc ref present — "
+                "keeping doc/domain filters (doc=%s)",
+                len(vector_results),
+                len(keyword_results),
+                resolved_doc_number,
+            )
+        else:
+            log.info(
+                "Filtered search too few results (%d+%d), retrying unfiltered (domains=%s, doc=%s)",
+                len(vector_results),
+                len(keyword_results),
+                legal_domains,
+                resolved_doc_number,
+            )
+            vector_results = vector_search(query=query, top_k=fetch_k, document_id=document_id)
+            keyword_results = await keyword_search(query=query, db=db, top_k=fetch_k)
 
     # ── 3. Merge with RRF ────────────────────────────────
     merged = _reciprocal_rank_fusion(vector_results, keyword_results)
@@ -570,6 +935,19 @@ async def hybrid_search(
         item["article_number"] = _normalize_article_number(item.get("article_number"))
         item["clause_number"] = _normalize_clause_number(item.get("clause_number"))
 
+    # ── 3.5. Penalize passages whose law_intents / legal_domain disagree with query domains ──
+    if not resolved_doc_number:
+        _apply_topic_mismatch_penalty(query, reranked)
+
+    # ── 4a. Boost điểm rerank khi chunk khớp domain đã phân loại (ưu tiên đúng lĩnh vực) ──
+    if legal_domains and reranked:
+        allowed_dom = set(legal_domains)
+        boost = 0.12
+        for item in reranked:
+            if item.get("legal_domain") in allowed_dom:
+                item["rerank_score"] = float(item.get("rerank_score", 0.0)) + boost
+        reranked.sort(key=lambda x: float(x.get("rerank_score", 0.0)), reverse=True)
+
     # ── 4b. Post-filter by domain when we had domain filter (incl. after fallback) ──
     # Only keep passages that explicitly match allowed domains; drop empty/other to avoid wrong-law citations.
     if legal_domains and reranked:
@@ -579,18 +957,20 @@ async def hybrid_search(
             reranked = filtered
             log.info("Domain post-filter: %d → %d passages (allowed=%s)", len(merged), len(reranked), list(allowed))
         else:
+            # Metadata legal_domain trên chunk có thể thiếu/sai lệch với classifier — không được trả rỗng.
             log.warning(
-                "Domain post-filter removed all passages (allowed=%s); keeping none to avoid wrong citations",
+                "Domain post-filter would drop all passages (allowed=%s); keeping boosted rerank list",
                 list(allowed),
             )
-            reranked = []
 
     # ── 4c. V3: đa dạng hóa theo document + quyết định số article động (sau rerank)
     if reranked:
         reranked = diversify_by_article(reranked, min_docs=3)
-        dyn_article_cap = dynamic_max_articles(reranked)
+        dyn_article_cap = dynamic_max_articles(reranked, query)
     else:
         dyn_article_cap = 1
+
+    reranked_before_article_collapse = list(reranked) if reranked else []
 
     # ── 5. Article selection mode ───────────────────────────
     # Winner-takes-all tĩnh đã thay bằng diversify + dynamic_max_articles (n_keep).
@@ -646,6 +1026,11 @@ async def hybrid_search(
                     reranked = selected[:final_k]
             else:
                 reranked = reranked[:final_k]
+
+    if reranked_before_article_collapse:
+        reranked = await _merge_amendment_expanded_passages(
+            db, reranked_before_article_collapse, reranked, query
+        )
 
     log.info(
         "Hybrid search: vector=%d keyword=%d merged=%d explicit_article=%s doc_ref=%s final=%d",

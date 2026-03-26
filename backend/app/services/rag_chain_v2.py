@@ -10,12 +10,13 @@ Enforces:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 import time
 from collections import defaultdict
-from typing import AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,7 +24,10 @@ from app.config import (
     ANSWER_VALIDATION_THRESHOLD,
     DEFAULT_TEMPERATURE,
     MULTI_ARTICLE_MAX_ARTICLES,
+    OPENAI_API_KEY,
     OPENAI_MODEL,
+    OUT_OF_SCOPE_USER_MESSAGE,
+    QUERY_UTTERANCE_CLASSIFIER_ENABLED,
     SYSTEM_PROMPT_V2,
     RAG_PROMPT_TEMPLATE_V2,
     COMMUNE_OFFICER_SYSTEM_PROMPT,
@@ -35,11 +39,37 @@ from app.retrieval.hybrid_retriever import hybrid_search
 from app.retrieval.vector_retriever import vector_search
 from app.cache.redis_cache import get_cached_answer, cache_answer
 from app.monitoring.chat_logger import log_interaction
-from app.services.llm_client import generate, generate_with_messages
+from app.services import conversation_repository as conv_repo
+from app.services.llm_client import (
+    generate,
+    generate_stream,
+    generate_with_messages,
+    generate_with_messages_stream,
+)
 from app.services.answer_validator import validate_article_completeness
 from app.services.query_understanding import analyze_query
+from app.services.query_text_patterns import (
+    answer_contains_explicit_doc_number,
+    article_sort_key_tuple,
+    context_describes_authority,
+    extract_article_numbers_mentioned_in_answer,
+    extract_article_reference_from_text,
+    extract_doc_numbers_from_text,
+    normalize_article_number_canonical,
+    normalize_doc_number_for_compare,
+    query_asks_fine_amount,
+    query_demands_specific_article,
+    query_expects_llm_synthesis_from_context,
+    query_looks_procedural,
+    query_requests_prohibited_acts_list,
+    sanitize_rag_llm_output,
+    shorten_title_long_parenthetical,
+    strip_answer_lines_with_hallucinated_doc_numbers,
+    title_contains_tham_quyen,
+)
 from app.services.query_expansion import needs_expansion, expand_query, should_expand_query_v2
 from app.services.intent_detector import get_rag_intents
+from app.services.query_intent import query_requires_multi_document_synthesis
 from app.services.article_grouper import (
     dedup_chunks,
     group_chunks_by_article,
@@ -49,6 +79,86 @@ from app.services.domain_classifier import classify_query_domain, get_domain_fil
 from app.tools import draft_tool
 
 log = logging.getLogger(__name__)
+
+_STREAM_SENTINEL = object()
+
+# Ngưỡng độ tin cậy để chọn câu hỏi gợi ý cuối câu trả lời (thấp vs cao).
+FOLLOWUP_LOW_CONFIDENCE_THRESHOLD = 0.5
+
+
+async def _persist_conv_turn(db: AsyncSession, conv_id: str, query: str, answer: str) -> None:
+    try:
+        if await conv_repo.add_message(db, conv_id, "user", query):
+            await conv_repo.add_message(db, conv_id, "assistant", answer or "")
+    except Exception as exc:
+        log.error("persist conv turn failed: %s", exc)
+
+
+async def _stream_emit_complete(
+    stream_queue: Optional[asyncio.Queue],
+    conv_id: str,
+    result: Dict,
+    *,
+    retried: bool = False,
+) -> None:
+    """Luồng không LLM hoặc trả lời tức thì: meta + sources + text_finalize."""
+    if stream_queue is None:
+        return
+    meta = {
+        "type": "meta",
+        "conversation_id": conv_id,
+        "retried": retried,
+        "confidence_score": float(result.get("confidence_score", 0.0) or 0.0),
+    }
+    await stream_queue.put(json.dumps(meta, ensure_ascii=False))
+    await stream_queue.put(
+        json.dumps({"type": "sources", "data": result.get("sources", [])}, ensure_ascii=False)
+    )
+    fin = {
+        "type": "text_finalize",
+        "text": result.get("answer", "") or "",
+        "confidence_score": float(result.get("confidence_score", 0.0) or 0.0),
+        "retried": retried,
+    }
+    await stream_queue.put(json.dumps(fin, ensure_ascii=False))
+
+
+async def _stream_emit_hybrid_prelude(
+    stream_queue: Optional[asyncio.Queue],
+    conv_id: str,
+    sources: List[Dict],
+) -> None:
+    if stream_queue is None:
+        return
+    await stream_queue.put(
+        json.dumps(
+            {
+                "type": "meta",
+                "conversation_id": conv_id,
+                "retried": False,
+                "confidence_score": 0.0,
+            },
+            ensure_ascii=False,
+        )
+    )
+    await stream_queue.put(json.dumps({"type": "sources", "data": sources}, ensure_ascii=False))
+
+
+async def _stream_emit_finalize(
+    stream_queue: Optional[asyncio.Queue],
+    result: Dict,
+    retried: bool,
+) -> None:
+    if stream_queue is None:
+        return
+    fin = {
+        "type": "text_finalize",
+        "text": result.get("answer", "") or "",
+        "confidence_score": float(result.get("confidence_score", 0.0) or 0.0),
+        "retried": retried,
+    }
+    await stream_queue.put(json.dumps(fin, ensure_ascii=False))
+
 
 def _get_rag_intent_flags(query: str) -> Dict[str, bool]:
     """Cờ RAG từ intent_detector (structural + semantic embedding), không dùng regex scenario/multi-article."""
@@ -144,16 +254,26 @@ async def _fallback_full_article_retrieval(
     return expanded
 
 
-def _extract_article_reference(text: str) -> Optional[str]:
-    m = re.search(r"điều\s+(\d+[a-zA-Z]?)", text or "", re.IGNORECASE)
-    return m.group(1) if m else None
-
-
-def _normalize_article_number(article_number: Optional[str]) -> Optional[str]:
-    if not article_number:
-        return None
-    m = re.search(r"(\d+[a-zA-Z]?)", str(article_number))
-    return m.group(1) if m else str(article_number).strip()
+def _query_requests_comparison(query: str) -> bool:
+    """Câu hỏi so sánh / đối chiếu — cần LLM tổng hợp, không dùng bản liệt kê đa nguồn."""
+    q = (query or "").lower()
+    return any(
+        p in q
+        for p in (
+            "so sánh",
+            "so sanh",
+            "đối chiếu",
+            "doi chieu",
+            "khác nhau",
+            "khac nhau",
+            "khác gì",
+            "khac gi",
+            "điểm khác",
+            "diem khac",
+            "so với",
+            "so voi",
+        )
+    )
 
 
 def _is_document_lookup_query(query: str) -> bool:
@@ -223,91 +343,15 @@ def _build_document_lookup_answer(sources: List[Dict]) -> str:
     return "\n".join(lines)
 
 
-def _build_multi_source_answer(query: str, sources: List[Dict]) -> str:
-    """Deterministic multi-source answer to avoid collapsing into one article."""
-    if not sources:
-        return NO_INFO_MESSAGE
-
-    docs: List[str] = []
-    seen_docs = set()
-    for s in sources:
-        label = _format_doc_label(s)
-        if not label:
-            continue
-        key = label.lower()
-        if key in seen_docs:
-            continue
-        seen_docs.add(key)
-        docs.append(label)
-
-    citations: List[str] = []
-    seen_cites = set()
-    for s in sources:
-        cite = (s.get("citation") or "").strip()
-        if not cite:
-            label = _format_doc_label(s)
-            article = _normalize_article_number(s.get("article_number"))
-            cite = f"{label} – Điều {article}" if label and article else label
-        if not cite:
-            continue
-        k = cite.lower()
-        if k in seen_cites:
-            continue
-        seen_cites.add(k)
-        citations.append(cite)
-
-    lines = [
-        "Câu trả lời:",
-        "",
-        f"Câu hỏi \"{query}\" được tổng hợp từ nhiều nguồn pháp lý trong cơ sở dữ liệu hiện có.",
-    ]
-    if docs:
-        lines.extend(["", "Các văn bản pháp luật liên quan:"])
-        lines.extend([f"- {d}" for d in docs[:12]])
-    if citations:
-        lines.extend(["", "Các điều khoản tiêu biểu liên quan:"])
-        lines.extend([f"- {c}" for c in citations[:15]])
-    lines.extend([
-        "",
-        "Lưu ý: Danh mục ngành, nghề đầu tư kinh doanh có điều kiện cần đối chiếu theo phụ lục/danh mục ban hành kèm văn bản còn hiệu lực tại thời điểm áp dụng.",
-    ])
-    return "\n".join(lines)
-
-
-def _should_use_multi_source_summary(
-    query: str,
-    sources: List[Dict],
-    *,
-    use_multi: bool,
-    multi_article_conditions: bool,
-) -> bool:
-    """Decide format by retrieval diversity instead of manual query regex."""
-    if not sources:
-        return False
-    if _is_document_lookup_query(query) or _query_demands_specific_article(query):
-        return False
-
-    unique_articles = len({s.get("article_id") for s in sources if s.get("article_id")})
-    unique_docs = len({(s.get("doc_number") or "").strip() for s in sources if (s.get("doc_number") or "").strip()})
-
-    # Strong evidence from retrieval diversity.
-    if unique_articles >= 3 and unique_docs >= 2:
-        return True
-    # Weaker diversity but query already routed to multi-article path.
-    if (use_multi or multi_article_conditions) and unique_articles >= 3:
-        return True
-    return False
-
-
 def _select_single_article_passages(passages: List[Dict], query: str) -> List[Dict]:
     """Keep passages from only one best-matching article to prevent article mixing."""
     if not passages:
         return []
 
-    query_article = _extract_article_reference(query)
+    query_article = extract_article_reference_from_text(query)
     grouped: Dict[str, List[Dict]] = defaultdict(list)
     for p in passages:
-        art_no = _normalize_article_number(p.get("article_number"))
+        art_no = normalize_article_number_canonical(p.get("article_number"))
         if art_no:
             p["article_number"] = art_no
             grouped[art_no].append(p)
@@ -321,12 +365,12 @@ def _select_single_article_passages(passages: List[Dict], query: str) -> List[Di
     # For "mức phạt" queries, deprioritize "thẩm quyền xử phạt" articles when
     # non-authority alternatives are available – they likely have the actual fine amounts.
     effective_grouped = grouped
-    if _query_asks_fine_amount(query):
+    if query_asks_fine_amount(query):
         non_authority = {
             art: chunks
             for art, chunks in grouped.items()
             if not any(
-                _THAM_QUYEN_TITLE_RE.search(c.get("article_title", "") or "")
+                title_contains_tham_quyen(c.get("article_title", "") or "")
                 for c in chunks
             )
         }
@@ -354,50 +398,6 @@ def _select_single_article_passages(passages: List[Dict], query: str) -> List[Di
 def _is_no_info_answer(answer: str) -> bool:
     normalized = (answer or "").strip().lower()
     return normalized == NO_INFO_MESSAGE.lower() or "không tìm thấy nội dung phù hợp" in normalized
-
-
-def _query_demands_specific_article(query: str) -> bool:
-    q = (query or "").lower()
-    return bool(re.search(r"\bđiều\s+\d+[a-zA-Z]?\b", q))
-
-
-# ── Fine-amount vs enforcement-authority mismatch detection ──────────────
-
-_MUC_PHAT_QUERY_RE = re.compile(
-    r"mức\s+phạt|mức\s+xử\s+phạt|phạt\s+bao\s+nhiêu"
-    r"|bị\s+phạt\s*(bao\s+nhiêu|như\s+thế\s+nào|thế\s+nào)"
-    r"|tiền\s+phạt|mức\s+tiền\s+phạt|hình\s+thức\s+xử\s+phạt",
-    re.IGNORECASE,
-)
-
-_THAM_QUYEN_TITLE_RE = re.compile(r"thẩm\s+quyền", re.IGNORECASE)
-
-_THAM_QUYEN_CONTEXT_RE = re.compile(
-    r"thẩm\s+quyền\s+xử\s+phạt"
-    r"|có\s+quyền\s*[:\-]?\s*(?:[a-z]\)\s*(?:phạt|cảnh\s+cáo)|xử\s+phạt)"
-    r"|được\s+quyền\s+phạt\s+tiền"
-    r"|có\s+quyền\s+(?:phạt\s+tiền|cảnh\s+cáo|tịch\s+thu)",
-    re.IGNORECASE,
-)
-
-
-def _query_asks_fine_amount(query: str) -> bool:
-    """Detect if the query is specifically asking about fine/penalty amounts."""
-    return bool(_MUC_PHAT_QUERY_RE.search(query or ""))
-
-
-def _article_is_tham_quyen(passages: List[Dict]) -> bool:
-    """Check if passages belong to a 'thẩm quyền xử phạt' (enforcement authority) article."""
-    for p in passages:
-        title = p.get("article_title", "") or ""
-        if _THAM_QUYEN_TITLE_RE.search(title):
-            return True
-    return False
-
-
-def _context_describes_authority(context: str) -> bool:
-    """Return True if retrieved context is about enforcement authority, not specific fine amounts."""
-    return bool(_THAM_QUYEN_CONTEXT_RE.search(context or ""))
 
 
 def _build_related_documents_fallback(sources: List[Dict]) -> str:
@@ -484,7 +484,7 @@ Chỉ sử dụng thông tin từ NGỮ CẢNH. KHÔNG bịa số liệu."""
         system=SYSTEM_PROMPT_V2,
         temperature=min(temperature, 0.1),
     )
-    return _sanitize_output(answer)
+    return sanitize_rag_llm_output(answer)
 
 
 def _force_no_info_if_needed(answer: str) -> str:
@@ -492,10 +492,119 @@ def _force_no_info_if_needed(answer: str) -> str:
     return NO_INFO_MESSAGE if _is_no_info_answer(answer) else answer
 
 
+def _extract_doc_reference_from_query(query: str) -> Optional[str]:
+    """Extract explicit legal document reference from user query."""
+    q = (query or "").strip()
+    if not q:
+        return None
+    m = re.search(r"(\d+/\d{4}/[A-ZĐa-zđ0-9\-]+)", q)
+    if m:
+        return m.group(1)
+    m2 = re.search(
+        r"(?:nghị\s*định|thông\s*tư|quyết\s*định|chỉ\s*thị|luật)\s+(?:số\s+)?(\d+/\d{4})",
+        q,
+        re.IGNORECASE,
+    )
+    return m2.group(1) if m2 else None
+
+
+def _query_requires_direct_legal_lookup(query: str) -> bool:
+    """True when query asks direct legal extraction, not procedural commune flow."""
+    q = (query or "").lower()
+    if not q:
+        return False
+    if _extract_doc_reference_from_query(query):
+        return True
+    legal_lookup_markers = (
+        "trích xuất",
+        "điều ",
+        "khoản ",
+        "theo nghị định",
+        "theo quyết định",
+        "theo luật",
+        "thẩm quyền",
+        "căn cứ pháp lý",
+    )
+    return any(k in q for k in legal_lookup_markers)
+
+
+def _query_topic_terms(query: str, *, max_terms: int = 6) -> List[str]:
+    """Extract topic anchors from user query for lightweight mismatch guard."""
+    q = (query or "").lower()
+    tokens = re.findall(r"[0-9a-zà-ỹđ]+", q, re.IGNORECASE)
+    stop = {
+        "là",
+        "về",
+        "theo",
+        "của",
+        "cho",
+        "và",
+        "các",
+        "những",
+        "như",
+        "thế",
+        "nào",
+        "quy",
+        "định",
+        "điều",
+        "khoản",
+        "tra",
+        "cứu",
+        "thẩm",
+        "quyền",
+        "quyết",
+        "định",
+        "văn",
+        "bản",
+        "pháp",
+        "luật",
+    }
+    out: List[str] = []
+    seen = set()
+    for t in tokens:
+        if len(t) < 4 or t in stop or t.isdigit():
+            continue
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+        if len(out) >= max_terms:
+            break
+    return out
+
+
+def _has_topic_overlap(passages: List[Dict], topic_terms: List[str]) -> bool:
+    if not passages or not topic_terms:
+        return True
+    text_blob = " ".join(
+        f"{p.get('document_title', '')} {p.get('text_chunk', '')}".lower()
+        for p in passages[:8]
+    )
+    hits = sum(1 for t in topic_terms if t in text_blob)
+    return hits >= 1
+
+
+def _passages_match_explicit_doc_ref(passages: List[Dict], query: str) -> List[Dict]:
+    """Keep only passages that match explicit doc reference in query."""
+    doc_ref = _extract_doc_reference_from_query(query)
+    if not doc_ref:
+        return passages
+    ref_norm = normalize_doc_number_for_compare(doc_ref)
+    matched: List[Dict] = []
+    for p in passages:
+        dn = normalize_doc_number_for_compare((p.get("doc_number") or ""))
+        dt = normalize_doc_number_for_compare((p.get("document_title") or ""))
+        if ref_norm in dn or ref_norm in dt:
+            matched.append(p)
+    return matched
+
+
 def _format_doc_label(source: Dict) -> str:
     """Build human-readable label that always prioritizes legal document number."""
     doc_number = (source.get("doc_number") or "").strip()
     doc_title = (source.get("document_title") or "").strip()
+    # Tiêu đề quá dài, ít khoảng trắng → thường là chuỗi ghép lỗi khi ingest
+    if doc_number and doc_title and len(doc_title) > 90 and doc_title.count(" ") < 5:
+        return doc_number
     if doc_number and doc_title:
         if doc_number.lower() in doc_title.lower():
             return doc_title
@@ -503,15 +612,11 @@ def _format_doc_label(source: Dict) -> str:
     return doc_number or doc_title
 
 
-def _answer_has_explicit_doc_number(answer: str) -> bool:
-    return bool(re.search(r"\b\d+/\d{4}/[A-ZĐa-zđ0-9\-]+\b", answer or ""))
-
-
 def _ensure_explicit_document_numbers(answer: str, sources: List[Dict]) -> str:
     """Ensure answer lists exact document numbers for legal document questions."""
     if not sources:
         return answer
-    if _answer_has_explicit_doc_number(answer):
+    if answer_contains_explicit_doc_number(answer):
         return answer
 
     labels: List[str] = []
@@ -539,7 +644,7 @@ def _convert_legacy_sources_to_v2(legacy_sources: List[Dict]) -> List[Dict]:
         meta = s.get("metadata", {}) or {}
         doc_title = meta.get("law_name") or meta.get("title") or ""
         doc_number = meta.get("doc_number", "")
-        article_number = _normalize_article_number(meta.get("article_number"))
+        article_number = normalize_article_number_canonical(meta.get("article_number"))
         citation = ""
         label = _format_doc_label({"doc_number": doc_number, "document_title": doc_title})
         if label and article_number:
@@ -595,7 +700,8 @@ YÊU CẦU:
 {query}
 
 Hãy trả lời theo dạng CHECKLIST PHÁP LÝ TỔNG HỢP:
-I. Danh mục văn bản pháp lý liên quan.
+I. Danh mục văn bản pháp lý liên quan — với mỗi văn bản ưu tiên một dòng dạng:
+   `- Số hiệu (vd. 38/2021/NĐ-CP): Điều 36, 56, 57` (gom các Điều cùng văn bản, không lặp tên văn bản cho từng Điều).
 II. Checklist chức năng, nhiệm vụ, thẩm quyền quản lý.
 III. Danh mục việc cần triển khai trong quản lý thực tế.
 
@@ -610,11 +716,11 @@ NGUYÊN TẮC BẮT BUỘC:
         system=SYSTEM_PROMPT_V2,
         temperature=min(temperature, 0.3),
     )
-    answer = _sanitize_output(answer)
+    answer = sanitize_rag_llm_output(answer)
     answer = _force_no_info_if_needed(answer)
 
     context_nums = _collect_context_doc_numbers(passages)
-    answer = _strip_hallucinated_doc_numbers(answer, context_nums)
+    answer = strip_answer_lines_with_hallucinated_doc_numbers(answer, context_nums)
 
     if _is_no_info_answer(answer) and sources:
         answer = _build_related_documents_fallback(sources)
@@ -676,7 +782,7 @@ async def _answer_commune_officer_query(
             system=COMMUNE_OFFICER_SYSTEM_PROMPT,
             temperature=min(temperature, 0.3),
         )
-        answer = _sanitize_output(answer)
+        answer = sanitize_rag_llm_output(answer)
         return {"answer": answer, "sources": [], "confidence_score": 0.4}
 
     passages = passages[:20]
@@ -697,10 +803,10 @@ async def _answer_commune_officer_query(
         system=COMMUNE_OFFICER_SYSTEM_PROMPT,
         temperature=min(temperature, 0.3),
     )
-    answer = _sanitize_output(answer)
+    answer = sanitize_rag_llm_output(answer)
 
     context_nums = _collect_context_doc_numbers(passages)
-    answer = _strip_hallucinated_doc_numbers(answer, context_nums)
+    answer = strip_answer_lines_with_hallucinated_doc_numbers(answer, context_nums)
 
     if _is_no_info_answer(answer) and sources:
         answer = _build_related_documents_fallback(sources)
@@ -714,7 +820,7 @@ async def _answer_commune_officer_query(
 async def _answer_drafting_query(query: str, temperature: float) -> Dict:
     """Answer administrative/legal drafting queries using dedicated drafting tool."""
     tool_result = await draft_tool.run(content=query, temperature=min(temperature, 0.35))
-    answer = _sanitize_output(tool_result.get("result", ""))
+    answer = sanitize_rag_llm_output(tool_result.get("result", ""))
     answer = _force_no_info_if_needed(answer)
     if not answer:
         answer = NO_INFO_MESSAGE
@@ -736,6 +842,8 @@ async def rag_query(
     temperature: float = DEFAULT_TEMPERATURE,
     doc_number: Optional[str] = None,
     conversation_id: Optional[str] = None,
+    stream_queue: Optional[asyncio.Queue] = None,
+    utterance_labels: Optional[Any] = None,
 ) -> Dict:
     """Run the full RAG pipeline: retrieve → build context → generate answer.
 
@@ -746,12 +854,11 @@ async def rag_query(
     """
     start_time = time.time()
 
-    from app.memory.conversation_store import conversation_store
-
-    if conversation_id and conversation_store.get(conversation_id):
+    if conversation_id and await conv_repo.conversation_exists(db, conversation_id):
         conv_id = conversation_id
     else:
-        conv_id = conversation_store.create()["id"]
+        created = await conv_repo.create_conversation(db, title=None)
+        conv_id = created["id"]
 
     # ── 0. Ninh Bình tool: câu hỏi phi pháp lý về Ninh Bình (địa lý, huyện, du lịch...)
     from app.services.ninh_binh_router import should_use_ninh_binh_tool, route_to_ninh_binh
@@ -759,18 +866,54 @@ async def rag_query(
         nb_result = await route_to_ninh_binh(query)
         if nb_result:
             latency = (time.time() - start_time) * 1000
-            await log_interaction(db, query, nb_result.get("answer", ""), [], 0.85, latency)
-            return _with_conv_meta(
-                {
-                    "answer": nb_result.get("answer", ""),
-                    "sources": nb_result.get("sources", []),
-                    "confidence_score": 0.85,
-                },
-                conv_id,
-            )
+            result = {
+                "answer": _append_followup_prompts(
+                    nb_result.get("answer", "") or "",
+                    0.85,
+                    has_sources=bool(nb_result.get("sources")),
+                ),
+                "sources": nb_result.get("sources", []),
+                "confidence_score": 0.85,
+            }
+            await log_interaction(db, query, result.get("answer", "") or "", [], 0.85, latency)
+            await _persist_conv_turn(db, conv_id, query, result.get("answer", "") or "")
+            await _stream_emit_complete(stream_queue, conv_id, result)
+            return _with_conv_meta(result, conv_id)
 
     analysis = analyze_query(query)
+    if utterance_labels is not None:
+        from app.services.query_route_classifier import merge_utterance_labels_into_analysis
+
+        analysis = merge_utterance_labels_into_analysis(
+            analysis, utterance_labels, query=query
+        )
+    elif QUERY_UTTERANCE_CLASSIFIER_ENABLED and OPENAI_API_KEY:
+        from app.services.query_route_classifier import (
+            classify_user_utterance,
+            merge_utterance_labels_into_analysis,
+        )
+
+        _ul = await classify_user_utterance(query, has_conversation=bool(conv_id))
+        if _ul is not None:
+            analysis = merge_utterance_labels_into_analysis(analysis, _ul, query=query)
+
     intent = analysis.get("intent", "")
+    detector_intent = str(analysis.get("detector_intent", "") or "")
+    det_for_scope = detector_intent
+    if det_for_scope == "nan" or intent == "out_of_scope":
+        latency = (time.time() - start_time) * 1000
+        oos = {
+            "answer": OUT_OF_SCOPE_USER_MESSAGE,
+            "sources": [],
+            "confidence_score": 0.0,
+            "query_analysis": analysis,
+        }
+        await log_interaction(db, query, oos["answer"], [], 0.0, latency)
+        await _persist_conv_turn(db, conv_id, query, oos["answer"])
+        await _stream_emit_complete(stream_queue, conv_id, oos)
+        return _with_conv_meta(oos, conv_id)
+
+    rag_intents = analysis.get("rag_flags") or _get_rag_intent_flags(query)
 
     # ── 1a. Legal domain for retrieval (all paths: commune, checklist, default) ──
     domain_filter = get_domain_filter_values(query)
@@ -782,10 +925,9 @@ async def rag_query(
             domain_filter,
         )
 
-    # ── 1b. RAG intent flags — intent_detector (structural + semantic embedding) ──
-    rag_intents = _get_rag_intent_flags(query)
+    # ── 1b. RAG intent flags — cùng nguồn với analyze_query (query_intent bundle) ──
     log.info(
-        "RAG intents (intent_detector): scenario=%s legal_lookup=%s multi_article=%s needs_expansion=%s",
+        "RAG intents (query_intent / analysis): scenario=%s legal_lookup=%s multi_article=%s needs_expansion=%s",
         rag_intents.get("is_scenario"),
         rag_intents.get("is_legal_lookup"),
         rag_intents.get("use_multi_article"),
@@ -806,16 +948,29 @@ async def rag_query(
                 log.warning("Ignoring stale no-info cache with existing sources: '%.50s...'", query)
             else:
                 log.info("Cache hit for query: '%.50s...'", query)
-                return _with_conv_meta(dict(cached), conv_id, retried=cached.get("retried", False))
+                out = dict(cached)
+                await _persist_conv_turn(db, conv_id, query, out.get("answer", "") or "")
+                await _stream_emit_complete(
+                    stream_queue, conv_id, out, retried=out.get("retried", False)
+                )
+                return _with_conv_meta(out, conv_id, retried=out.get("retried", False))
 
-    # ── Commune-level intent routing ─────────────────────
+    # ── Commune officer pipeline: semantic margin + LLM khi mơ hồ ──
     from app.services.intent_detector import COMMUNE_LEVEL_INTENTS
+    from app.services.commune_route_arbiter import resolve_use_commune_officer_pipeline
+
     commune_situation = analysis.get("commune_situation")
-    is_commune_query = (
+    legacy_commune_hint = (
         intent in COMMUNE_LEVEL_INTENTS
         or (commune_situation and commune_situation.get("violation", "không có") != "không có")
         or rag_intents.get("is_scenario", False)
     )
+    if query_requires_multi_document_synthesis(query) or _query_requires_direct_legal_lookup(query):
+        is_commune_query = False
+    else:
+        is_commune_query = await resolve_use_commune_officer_pipeline(
+            query, legacy_commune_hint=legacy_commune_hint
+        )
 
     if is_commune_query:
         result = await _answer_commune_officer_query(
@@ -828,10 +983,17 @@ async def rag_query(
         await cache_answer(query, result)
         latency = (time.time() - start_time) * 1000
         doc_numbers = list({s.get("doc_number", "") for s in result.get("sources", [])})
+        result["answer"] = _append_followup_prompts(
+            result.get("answer", "") or "",
+            float(result.get("confidence_score", 0.0) or 0.0),
+            has_sources=bool(result.get("sources")),
+        )
         await log_interaction(
             db, query, result.get("answer", ""),
             doc_numbers, result.get("confidence_score", 0.0), latency,
         )
+        await _persist_conv_turn(db, conv_id, query, result.get("answer", "") or "")
+        await _stream_emit_complete(stream_queue, conv_id, result)
         return _with_conv_meta(result, conv_id)
 
     # Intent-specific routes
@@ -843,6 +1005,11 @@ async def rag_query(
             doc_number=doc_number,
             legal_domains=domain_filter,
         )
+        result["answer"] = _append_followup_prompts(
+            result.get("answer", "") or "",
+            float(result.get("confidence_score", 0.0) or 0.0),
+            has_sources=bool(result.get("sources")),
+        )
         await cache_answer(query, result)
         latency = (time.time() - start_time) * 1000
         doc_numbers = list({s.get("doc_number", "") for s in result.get("sources", [])})
@@ -854,10 +1021,17 @@ async def rag_query(
             result.get("confidence_score", 0.0),
             latency,
         )
+        await _persist_conv_turn(db, conv_id, query, result.get("answer", "") or "")
+        await _stream_emit_complete(stream_queue, conv_id, result)
         return _with_conv_meta(result, conv_id)
 
     if intent == "document_drafting":
         result = await _answer_drafting_query(query=query, temperature=temperature)
+        result["answer"] = _append_followup_prompts(
+            result.get("answer", "") or "",
+            float(result.get("confidence_score", 0.0) or 0.0),
+            has_sources=bool(result.get("sources")),
+        )
         await cache_answer(query, result)
         latency = (time.time() - start_time) * 1000
         doc_numbers = list({s.get("doc_number", "") for s in result.get("sources", [])})
@@ -869,13 +1043,22 @@ async def rag_query(
             result.get("confidence_score", 0.0),
             latency,
         )
+        await _persist_conv_turn(db, conv_id, query, result.get("answer", "") or "")
+        await _stream_emit_complete(stream_queue, conv_id, result)
         return _with_conv_meta(result, conv_id)
 
     if intent == "document_summary":
-        from app.services.document_summarizer import list_document_articles
-        summary_result = await list_document_articles(query)
+        from app.services.document_summarizer import summarize_matched_document
+        summary_result = await summarize_matched_document(
+            query=query,
+            temperature=min(temperature, 0.25),
+        )
         result = {
-            "answer": summary_result.get("summary", ""),
+            "answer": _append_followup_prompts(
+                summary_result.get("summary", "") or "",
+                float(summary_result.get("confidence_score", 0.0) or 0.0),
+                has_sources=bool(summary_result.get("sources")),
+            ),
             "sources": summary_result.get("sources", []),
             "confidence_score": summary_result.get("confidence_score", 0.0),
         }
@@ -886,6 +1069,8 @@ async def rag_query(
             db, query, result["answer"], doc_numbers,
             result["confidence_score"], latency,
         )
+        await _persist_conv_turn(db, conv_id, query, result.get("answer", "") or "")
+        await _stream_emit_complete(stream_queue, conv_id, result)
         return _with_conv_meta(result, conv_id)
 
     # ── 2. Hybrid retrieval (with multi-query expansion) ──
@@ -901,6 +1086,9 @@ async def rag_query(
     multi_article_conditions = (
         rag_intents.get("use_multi_article", False) and USE_MULTI_ARTICLE_FOR_CONDITIONS
     )
+    if query_requests_prohibited_acts_list(query):
+        multi_article_conditions = True
+        use_multi = True
     if use_multi:
         passages = await _multi_query_retrieve(
             query=query, db=db, doc_number=doc_number,
@@ -917,9 +1105,46 @@ async def rag_query(
             max_articles=MULTI_ARTICLE_MAX_ARTICLES if multi_article_conditions else None,
         )
 
+    # If user cites explicit document number, do not answer from other documents.
+    strict_doc_passages = _passages_match_explicit_doc_ref(passages, query)
+    if _extract_doc_reference_from_query(query):
+        passages = strict_doc_passages
+
+    # Lightweight topic mismatch guard: avoid answering from unrelated legal domain.
+    topic_terms = _query_topic_terms(query)
+    if passages and not _has_topic_overlap(passages, topic_terms) and not _extract_doc_reference_from_query(query):
+        log.warning("Topic mismatch suspected, retrying retrieval with topic anchors: %s", topic_terms)
+        topic_query = " ".join(topic_terms[:4]) + " " + query
+        passages_retry = await hybrid_search(
+            query=topic_query.strip(),
+            db=db,
+            doc_number=doc_number,
+            legal_domains=domain_filter,
+            single_article_only=not multi_article_conditions,
+            max_articles=MULTI_ARTICLE_MAX_ARTICLES if multi_article_conditions else None,
+        )
+        if _has_topic_overlap(passages_retry, topic_terms):
+            passages = passages_retry
+
     # ── 3. Build context ─────────────────────────────────
+    if not passages and query_looks_procedural(query):
+        # Procedural queries are brittle with strict domain filters/doc constraints:
+        # retry once with relaxed filters before returning NO_INFO.
+        log.info("Procedural query with empty retrieval — retrying relaxed search.")
+        relaxed_doc = None
+        if doc_number:
+            relaxed_doc = doc_number
+        passages = await hybrid_search(
+            query=query,
+            db=db,
+            doc_number=relaxed_doc,
+            legal_domains=None,
+            single_article_only=False,
+            max_articles=MULTI_ARTICLE_MAX_ARTICLES,
+        )
+
     if not passages:
-        answer = NO_INFO_MESSAGE
+        answer = _append_followup_prompts(NO_INFO_MESSAGE, 0.0, has_sources=False)
         result = {
             "answer": answer,
             "sources": [],
@@ -927,6 +1152,8 @@ async def rag_query(
         }
         latency = (time.time() - start_time) * 1000
         await log_interaction(db, query, answer, [], 0.0, latency)
+        await _persist_conv_turn(db, conv_id, query, answer)
+        await _stream_emit_complete(stream_queue, conv_id, result)
         return _with_conv_meta(result, conv_id)
 
     # For multi-article / condition queries, group by article for structured context
@@ -939,18 +1166,11 @@ async def rag_query(
         context = _build_context(passages)
     sources = _extract_sources(passages)
 
-    prefer_multi_source_summary = _should_use_multi_source_summary(
-        query,
-        sources,
-        use_multi=bool(use_multi),
-        multi_article_conditions=bool(multi_article_conditions),
-    )
-
     # Query type: user asks "which legal document(s)".
-    # If retrieval evidence is strongly multi-source, prefer synthesis mode below.
-    if _is_document_lookup_query(query) and not prefer_multi_source_summary:
+    if _is_document_lookup_query(query):
         answer = _build_document_lookup_answer(sources)
         confidence = _compute_confidence(passages, answer)
+        answer = _append_followup_prompts(answer, confidence, has_sources=bool(sources))
         result = {
             "answer": answer,
             "sources": sources,
@@ -960,45 +1180,53 @@ async def rag_query(
         latency = (time.time() - start_time) * 1000
         doc_numbers = list({s.get("doc_number", "") for s in sources})
         await log_interaction(db, query, answer, doc_numbers, confidence, latency)
+        await _persist_conv_turn(db, conv_id, query, answer)
+        await _stream_emit_complete(stream_queue, conv_id, result)
         return _with_conv_meta(result, conv_id)
 
-    if prefer_multi_source_summary:
-        answer = _build_multi_source_answer(query, sources)
-        answer = _ensure_legal_citations(answer, sources)
-        answer = _ensure_response_format(answer)
-        confidence = _compute_confidence(passages, answer)
-        result = {
-            "answer": answer,
-            "sources": sources,
-            "confidence_score": confidence,
-        }
-        await cache_answer(query, result)
-        latency = (time.time() - start_time) * 1000
-        doc_numbers = list({s.get("doc_number", "") for s in sources})
-        await log_interaction(db, query, answer, doc_numbers, confidence, latency)
-        return _with_conv_meta(result, conv_id)
+    # ── 4. Generate answer (luôn qua LLM khi có passages — tránh stub chỉ liệt kê văn bản) ──
+    prompt = _build_rag_user_prompt(query, context)
 
-    # ── 4. Generate answer ───────────────────────────────
-    prompt = RAG_PROMPT_TEMPLATE_V2.format(context=context, question=query)
-
-    hist = conversation_store.get_history(conv_id, limit=20)
-    conv_messages = [{"role": m["role"], "content": m["content"]} for m in hist if m.get("role") in ("user", "assistant")]
+    hist = await conv_repo.get_history(db, conv_id, limit=20)
+    conv_messages = [
+        {"role": m["role"], "content": m["content"]}
+        for m in hist
+        if m.get("role") in ("user", "assistant")
+    ]
     if conv_messages:
         messages = (
             [{"role": "system", "content": SYSTEM_PROMPT_V2}]
             + conv_messages
             + [{"role": "user", "content": prompt}]
         )
-        answer = await generate_with_messages(messages, temperature=temperature)
+        if stream_queue is not None:
+            await _stream_emit_hybrid_prelude(stream_queue, conv_id, sources)
+            answer = ""
+            async for delta in generate_with_messages_stream(messages, temperature=temperature):
+                answer += delta
+                await stream_queue.put(delta)
+        else:
+            answer = await generate_with_messages(messages, temperature=temperature)
     else:
-        answer = await generate(
-            prompt=prompt,
-            system=SYSTEM_PROMPT_V2,
-            temperature=temperature,
-        )
+        if stream_queue is not None:
+            await _stream_emit_hybrid_prelude(stream_queue, conv_id, sources)
+            answer = ""
+            async for delta in generate_stream(
+                prompt=prompt,
+                system=SYSTEM_PROMPT_V2,
+                temperature=temperature,
+            ):
+                answer += delta
+                await stream_queue.put(delta)
+        else:
+            answer = await generate(
+                prompt=prompt,
+                system=SYSTEM_PROMPT_V2,
+                temperature=temperature,
+            )
 
     # ── 5. Sanitize output (strip leaked metadata) ───────
-    answer = _sanitize_output(answer)
+    answer = sanitize_rag_llm_output(answer)
     answer = _force_no_info_if_needed(answer)
 
     # If LLM says NO_INFO while context exists, retry with extractive instruction.
@@ -1013,7 +1241,7 @@ async def rag_query(
             system=SYSTEM_PROMPT_V2,
             temperature=0.0,
         )
-        answer = _sanitize_output(answer)
+        answer = sanitize_rag_llm_output(answer)
         answer = _force_no_info_if_needed(answer)
 
     # ── 5b. Context-query alignment: mức phạt vs thẩm quyền ─
@@ -1023,15 +1251,15 @@ async def rag_query(
     # (c) a pointer to the specific violation article for exact fine amounts.
     if (
         not _is_no_info_answer(answer)
-        and _query_asks_fine_amount(query)
-        and _context_describes_authority(context)
+        and query_asks_fine_amount(query)
+        and context_describes_authority(context)
     ):
         log.info(
             "Context-query mismatch: query asks mức phạt but context is thẩm quyền – "
             "regenerating with authority summary."
         )
         answer = await _answer_with_authority_summary(query, context, sources, temperature)
-        answer = _sanitize_output(answer)
+        answer = sanitize_rag_llm_output(answer)
         answer = _force_no_info_if_needed(answer)
 
     # ── 6. Article completeness check + fallback ─────────
@@ -1047,22 +1275,22 @@ async def rag_query(
         passages = await _fallback_full_article_retrieval(db, passages, query)
         context = _build_context(passages)
         sources = _extract_sources(passages)
-        prompt = RAG_PROMPT_TEMPLATE_V2.format(context=context, question=query)
+        prompt = _build_rag_user_prompt(query, context)
         answer = await generate(
             prompt=prompt,
             system=SYSTEM_PROMPT_V2,
             temperature=temperature,
         )
-        answer = _sanitize_output(answer)
+        answer = sanitize_rag_llm_output(answer)
 
     # ── 7. Anti-hallucination: article mismatch guard ────
-    expected_article = _normalize_article_number(passages[0].get("article_number")) if passages else None
-    answer_article = _extract_article_reference(answer)
+    expected_article = normalize_article_number_canonical(passages[0].get("article_number")) if passages else None
+    answer_article = extract_article_reference_from_text(answer)
     if (
         expected_article
         and answer_article
         and answer_article != expected_article
-        and _query_demands_specific_article(query)
+        and query_demands_specific_article(query)
     ):
         log.warning(
             "Answer article mismatch detected (expected=%s, got=%s). Returning NO_INFO.",
@@ -1073,7 +1301,7 @@ async def rag_query(
 
     # ── 7b. Anti-hallucination: strip doc numbers not in context ─
     context_nums = _collect_context_doc_numbers(passages)
-    answer = _strip_hallucinated_doc_numbers(answer, context_nums)
+    answer = strip_answer_lines_with_hallucinated_doc_numbers(answer, context_nums)
 
     # If answer still says no-info while we do have legal sources, downgrade to case-2 related-docs answer.
     if _is_no_info_answer(answer) and sources:
@@ -1107,20 +1335,20 @@ async def rag_query(
         )
         if passages2:
             passages2 = diversify_by_article(passages2, min_docs=3)
-            _ = dynamic_max_articles(passages2)
+            _ = dynamic_max_articles(passages2, query)
             groups2 = group_chunks_by_article(dedup_chunks(passages2))
             context2 = format_grouped_context(groups2)
             sources2 = _extract_sources(passages2)
-            prompt2 = RAG_PROMPT_TEMPLATE_V2.format(context=context2, question=query)
+            prompt2 = _build_rag_user_prompt(query, context2)
             answer2 = await generate(
                 prompt=prompt2,
                 system=SYSTEM_PROMPT_V2,
                 temperature=temperature,
             )
-            answer2 = _sanitize_output(answer2)
+            answer2 = sanitize_rag_llm_output(answer2)
             answer2 = _force_no_info_if_needed(answer2)
             context_nums2 = _collect_context_doc_numbers(passages2)
-            answer2 = _strip_hallucinated_doc_numbers(answer2, context_nums2)
+            answer2 = strip_answer_lines_with_hallucinated_doc_numbers(answer2, context_nums2)
             if _is_no_info_answer(answer2) and sources2:
                 answer2 = _build_related_documents_fallback(sources2)
             answer2 = _ensure_legal_citations(answer2, sources2)
@@ -1160,6 +1388,8 @@ async def rag_query(
         except Exception as exc:
             log.error("fallback_reasoning failed: %s", exc)
 
+    answer = _append_followup_prompts(answer, confidence, has_sources=bool(sources))
+
     # ── 10. Cache result ─────────────────────────────────
     result = {
         "answer": answer,
@@ -1172,11 +1402,8 @@ async def rag_query(
     latency = (time.time() - start_time) * 1000
     doc_numbers = list({s.get("doc_number", "") for s in sources})
     await log_interaction(db, query, answer, doc_numbers, confidence, latency)
-    try:
-        conversation_store.add_message(conv_id, "user", query)
-        conversation_store.add_message(conv_id, "assistant", answer)
-    except Exception as exc:
-        log.error("conversation_store add_message failed: %s", exc)
+    await _stream_emit_finalize(stream_queue, result, retried)
+    await _persist_conv_turn(db, conv_id, query, result.get("answer", "") or "")
 
     return _with_conv_meta(result, conv_id, retried=retried)
 
@@ -1187,158 +1414,139 @@ async def rag_query_stream(
     temperature: float = DEFAULT_TEMPERATURE,
     doc_number: Optional[str] = None,
     conversation_id: Optional[str] = None,
+    utterance_labels: Optional[Any] = None,
 ) -> AsyncGenerator[str, None]:
-    """Streaming wrapper that guarantees the same post-processed output as rag_query."""
-    result = await rag_query(
-        query=query,
-        db=db,
-        temperature=temperature,
-        doc_number=doc_number,
-        conversation_id=conversation_id,
-    )
+    """SSE payload strings: JSON events (meta, sources, text_finalize) và chunk text thô từ LLM."""
+    queue: asyncio.Queue = asyncio.Queue()
 
-    meta_event = json.dumps(
-        {
-            "type": "meta",
-            "conversation_id": result.get("conversation_id"),
-            "retried": result.get("retried", False),
-            "confidence_score": result.get("confidence_score", 0.0),
-        },
-        ensure_ascii=False,
-    )
-    yield meta_event + "\n"
+    async def runner() -> None:
+        try:
+            await rag_query(
+                query=query,
+                db=db,
+                temperature=temperature,
+                doc_number=doc_number,
+                conversation_id=conversation_id,
+                stream_queue=queue,
+                utterance_labels=utterance_labels,
+            )
+        finally:
+            await queue.put(_STREAM_SENTINEL)
 
-    sources_event = json.dumps(
-        {"type": "sources", "data": result.get("sources", [])},
-        ensure_ascii=False,
-    )
-    yield sources_event + "\n"
-
-    answer = result.get("answer", "") or NO_INFO_MESSAGE
-    for i in range(0, len(answer), 80):
-        yield answer[i : i + 80]
+    task = asyncio.create_task(runner())
+    try:
+        while True:
+            item = await queue.get()
+            if item is _STREAM_SENTINEL:
+                break
+            yield item
+    finally:
+        await task
 
 
 # ── Helpers ───────────────────────────────────────────────
-
-# Patterns matching internal metadata JSON that should never appear in answers
-_METADATA_JSON_PATTERN = re.compile(
-    r'\{[^{}]*"(?:sources|confidence_score|document_id|vector_score|similarity|embedding)'
-    r'[^{}]*\}',
-    re.DOTALL,
-)
-_METADATA_FIELD_PATTERN = re.compile(
-    r'"(?:sources|confidence_score|document_id|score|vector_score|similarity|embedding(?:_metadata)?)"'
-    r'\s*:\s*(?:\[.*?\]|"[^"]*"|\d+(?:\.\d+)?|null|true|false)',
-    re.DOTALL,
-)
-
-
-def _sanitize_output(text: str) -> str:
-    """Remove any leaked internal metadata from the answer text.
-
-    Strips JSON fragments containing internal fields like sources,
-    confidence_score, document_id, score, vector_score, similarity.
-    """
-    if not text:
-        return text
-
-    # Remove full JSON objects containing metadata keys
-    cleaned = _METADATA_JSON_PATTERN.sub("", text)
-
-    # Remove standalone JSON-like fragments with metadata fields
-    cleaned = _METADATA_FIELD_PATTERN.sub("", cleaned)
-
-    # Clean up leftover empty braces/brackets and excessive whitespace
-    cleaned = re.sub(r'\{\s*,?\s*\}', '', cleaned)
-    cleaned = re.sub(r'\[\s*,?\s*\]', '', cleaned)
-    cleaned = re.sub(r"```(?:\w+)?\n", "", cleaned)
-    cleaned = cleaned.replace("```", "")
-    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
-
-    return cleaned.strip()
-
-
-_DOC_NUMBER_RE = re.compile(r"\b(\d+[/_]\d{4}[/_][A-ZĐa-zđ\-]+)\b")
-
-
-def _extract_doc_numbers_from_text(text: str) -> set[str]:
-    """Extract all document numbers (e.g. 01/2021/TT-BVHTTDL) from text."""
-    return {m.group(1).replace("_", "/") for m in _DOC_NUMBER_RE.finditer(text or "")}
 
 
 def _collect_context_doc_numbers(passages: List[Dict]) -> set[str]:
     """Collect all document numbers present in retrieved passages (context)."""
     nums: set[str] = set()
     for p in passages:
-        nums |= _extract_doc_numbers_from_text(p.get("text_chunk", ""))
-        nums |= _extract_doc_numbers_from_text(p.get("document_title", ""))
-        nums |= _extract_doc_numbers_from_text(p.get("doc_number", ""))
+        nums |= extract_doc_numbers_from_text(p.get("text_chunk", ""))
+        nums |= extract_doc_numbers_from_text(p.get("document_title", ""))
+        nums |= extract_doc_numbers_from_text(p.get("doc_number", ""))
     return {n.replace("_", "/") for n in nums}
 
 
-def _normalize_for_comparison(doc_num: str) -> str:
-    """Normalize doc number for comparison: NĐ→ND, QĐ→QD, lowercase."""
-    s = doc_num.replace("_", "/").replace("Đ", "D").replace("đ", "d").lower()
-    return s
+def _citation_group_key(source: Dict) -> str:
+    dn = (source.get("doc_number") or "").strip().replace("_", "/")
+    if dn:
+        return normalize_doc_number_for_compare(dn)
+    t = (source.get("document_title") or "").strip()[:120]
+    return t.lower() or "__unknown__"
 
 
-def _strip_hallucinated_doc_numbers(answer: str, context_doc_numbers: set[str]) -> str:
-    """Remove document references from the answer that don't exist in context."""
-    if not context_doc_numbers or not answer:
-        return answer
-
-    context_normalized = {_normalize_for_comparison(n) for n in context_doc_numbers}
-    answer_doc_numbers = _extract_doc_numbers_from_text(answer)
-
-    hallucinated = {
-        n for n in answer_doc_numbers
-        if _normalize_for_comparison(n) not in context_normalized
-    }
-
-    if not hallucinated:
-        return answer
-
-    log.warning(
-        "[ANTI-HALLUCINATION] Stripping doc numbers not in context: %s",
-        hallucinated,
-    )
-
-    cleaned = answer
-    for bad_num in hallucinated:
-        cleaned = re.sub(
-            rf"[^\n]*{re.escape(bad_num)}[^\n]*\n?",
-            "",
-            cleaned,
-        )
-
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-    return cleaned or NO_INFO_MESSAGE
+def _short_citation_label(source: Dict) -> str:
+    """Nhãn ngắn cho căn cứ: ưu tiên số hiệu; tránh lặp mô tả dài trong ngoặc."""
+    dn = (source.get("doc_number") or "").strip().replace("_", "/")
+    if dn:
+        return dn
+    title = (source.get("document_title") or "").strip()
+    if not title:
+        return "Văn bản"
+    title = shorten_title_long_parenthetical(title)
+    return title if len(title) <= 220 else title[:217] + "…"
 
 
-def _format_legal_citation(sources: List[Dict]) -> str:
-    """Convert source metadata into a readable legal citation block.
+def _strip_trailing_legal_basis(answer: str) -> tuple[str, bool]:
+    """Gỡ khối 'Căn cứ pháp lý' ở CUỐI bài. Trả (text, đã_gỡ)."""
+    if not answer:
+        return answer, False
+    lower = answer.lower()
+    key = "căn cứ pháp lý"
+    idx = lower.rfind(key)
+    if idx < 0:
+        return answer, False
+    # Chỉ gỡ khi mục căn cứ nằm ở nửa sau bài (tránh cắt nhầm mục giữa template cán bộ xã)
+    if len(answer) > 100 and idx < int(len(answer) * 0.35):
+        return answer, False
+    return answer[:idx].rstrip(), True
 
-    Format:
-        Căn cứ pháp lý:
-        - <doc_number> – Điều <article_number>
+
+def _format_legal_citation(sources: List[Dict], answer: str = "") -> str:
+    """Căn cứ pháp lý gom theo văn bản: `- Số hiệu: Điều 1, 2, 3`.
+
+    Chỉ gom các Điều thực sự xuất hiện trong phần trả lời (tránh liệt kê mọi Điều đã retrieve).
     """
     if not sources:
         return ""
 
+    mentioned = extract_article_numbers_mentioned_in_answer(answer) if answer else set()
+    cite_pool = list(sources)
+    if mentioned:
+        filtered: List[Dict] = []
+        for s in sources:
+            art = normalize_article_number_canonical(s.get("article_number"))
+            if not art:
+                filtered.append(s)
+            elif art in mentioned:
+                filtered.append(s)
+        if filtered:
+            cite_pool = filtered
+        else:
+            cite_pool = list(sources)[:10]
+    else:
+        cite_pool = list(sources)[:12]
+
+    groups: Dict[str, Dict[str, object]] = {}
+    order_keys: List[str] = []
+
+    for s in cite_pool:
+        key = _citation_group_key(s)
+        if key not in groups:
+            groups[key] = {"label": _short_citation_label(s), "articles": []}
+            order_keys.append(key)
+        art = normalize_article_number_canonical(s.get("article_number"))
+        if art:
+            groups[key]["articles"].append(art)  # type: ignore[index]
+
     lines = ["Căn cứ pháp lý:"]
-    seen = set()
-    for s in sources:
-        citation = (s.get("citation", "") or "").strip()
-        if not citation:
-            label = _format_doc_label(s)
-            article = _normalize_article_number(s.get("article_number"))
-            citation = f"{label} – Điều {article}" if label and article else label
-        if not citation or citation.lower() == "string":
+    for key in order_keys:
+        g = groups[key]
+        label = str(g["label"])
+        if label.lower() == "string":
             continue
-        if citation and citation not in seen:
-            seen.add(citation)
-            lines.append(f"- {citation}")
+        arts_list: List[str] = g["articles"]  # type: ignore[assignment]
+        seen_a: set = set()
+        ordered: List[str] = []
+        for a in arts_list:
+            if a and a not in seen_a:
+                seen_a.add(a)
+                ordered.append(a)
+        ordered.sort(key=article_sort_key_tuple)
+        if ordered:
+            lines.append(f"- {label}: Điều {', '.join(ordered)}")
+        else:
+            lines.append(f"- {label}")
 
     if len(lines) <= 1:
         return ""
@@ -1346,25 +1554,92 @@ def _format_legal_citation(sources: List[Dict]) -> str:
 
 
 def _ensure_legal_citations(answer: str, sources: List[Dict]) -> str:
-    """Ensure the answer has a proper legal citation section.
-
-    If the answer already contains 'Căn cứ pháp lý:' or 'Nguồn:', skip.
-    Otherwise, append formatted citations.
-    """
+    """Gắn khối căn cứ gom Điều từ metadata; thay khối căn cứ cuối LLM nếu gỡ được."""
     if not sources:
         return answer
 
     if _is_no_info_answer(answer):
         return answer
 
-    lower_answer = answer.lower()
-    if "căn cứ pháp lý" in lower_answer or "nguồn:" in lower_answer:
+    trimmed, stripped = _strip_trailing_legal_basis(answer)
+    trimmed = trimmed.rstrip()
+    citation_block = _format_legal_citation(sources, answer=trimmed)
+    if not citation_block:
         return answer
+    if not stripped and "căn cứ pháp lý" in answer.lower():
+        # Đã có mục căn cứ ở giữa bài (vd. pipeline cán bộ xã) — không thêm khối trùng
+        return answer
+    return f"{trimmed}\n\n{citation_block}"
 
-    citation_block = _format_legal_citation(sources)
-    if citation_block:
-        return f"{answer}\n\n{citation_block}"
-    return answer
+
+def _append_followup_prompts(
+    answer: str,
+    confidence: float,
+    *,
+    has_sources: bool = True,
+) -> str:
+    """Câu hỏi dẫn dắt cuối phản hồi — phụ thuộc độ tin cậy ước lượng."""
+    a = (answer or "").rstrip()
+    if not a:
+        return a
+
+    leader = "Để tiếp tục hỗ trợ phù hợp hơn, xin ghi nhận ý kiến của anh/chị:"
+
+    if _is_no_info_answer(a):
+        return (
+            f"{a}\n\n---\n{leader} Anh/chị có thể nêu thêm bối cảnh, số hiệu văn bản hoặc "
+            "diễn đạt lại câu hỏi để hệ thống tra cứu chính xác hơn không?"
+        )
+
+    try:
+        conf = float(confidence)
+    except (TypeError, ValueError):
+        conf = 0.0
+
+    if not has_sources:
+        tail = (
+            f"{leader} Nội dung trên mang tính định hướng chung. Anh/chị cần tra cứu thêm "
+            "văn bản cụ thể hay chi tiết nào nữa không?"
+        )
+    elif conf < FOLLOWUP_LOW_CONFIDENCE_THRESHOLD:
+        tail = (
+            f"{leader} Anh/chị xem phần trả lời và căn cứ pháp lý đã giải đúng thắc mắc chưa? "
+            "Nếu chưa, vui lòng cho biết phần còn thiếu hoặc cần làm rõ thêm."
+        )
+    else:
+        tail = (
+            f"{leader} Anh/chị cần hỗ trợ thêm nội dung nào nữa "
+            "(điều khoản chi tiết, thủ tục, thẩm quyền, mức phạt, so sánh văn bản…) không?"
+        )
+
+    return f"{a}\n\n---\n{tail}"
+
+
+def _build_rag_user_prompt(query: str, context: str) -> str:
+    base = RAG_PROMPT_TEMPLATE_V2.format(context=context, question=query)
+    if _query_requests_comparison(query):
+        base += (
+            "\n\n━━ YÊU CẦU SO SÁNH/ĐỐI CHIẾU ━━\n"
+            "Câu hỏi yêu cầu so sánh hoặc nêu điểm khác giữa các văn bản. Bắt buộc: "
+            "(1) nêu quy định chính theo TỪNG số hiệu văn bản; "
+            "(2) sau đó nêu rõ điểm giống và khác nếu ngữ cảnh cho phép; "
+            "(3) không chỉ liệt kê điều khoản mà thiếu phân tích đối chiếu.\n"
+        )
+    elif query_expects_llm_synthesis_from_context(query):
+        base += (
+            "\n\n━━ TRẢ LỜI TRỰC TIẾP CÂU HỎI ━━\n"
+            "Câu hỏi yêu cầu thông tin CỤ THỂ (mức phạt/số tiền, điều kiện, yêu cầu pháp lý, "
+            "thủ tục, văn bản hoặc điều khoản căn cứ…). "
+            "Phần **Câu trả lời:** phải trả lời đúng trọng tâm ngay từ đầu, trích từ NGỮ CẢNH "
+            "(số điều, khung tiền, nội dung chính); "
+            "KHÔNG chỉ nói hệ thống đã truy xuất văn bản hoặc chỉ liệt kê tên văn bản mà không trả lời.\n"
+        )
+    base += (
+        "\n\n━━ KHÔNG ĐƯỢC ━━\n"
+        "Không mở bài bằng câu 'Hệ thống đã truy xuất nhiều đoạn…' rồi chỉ liệt kê tên văn bản. "
+        "Bắt buộc trích và/hoặc hệ thống hóa nội dung các Điều/Khoản trong NGỮ CẢNH để trả lời đúng câu hỏi.\n"
+    )
+    return base
 
 
 def _ensure_document_list(answer: str, sources: List[Dict]) -> str:
@@ -1409,6 +1684,12 @@ def _ensure_response_format(answer: str) -> str:
     if not answer or answer.strip() == NO_INFO_MESSAGE:
         return answer
     normalized = answer.strip()
+    # Gộp tiêu đề "Câu trả lời:" lặp liên tiếp ở đầu bài
+    normalized = re.sub(
+        r"(?is)^(?:\s*câu trả lời\s*:\s*\n*){2,}",
+        "Câu trả lời:\n\n",
+        normalized,
+    )
     if not normalized.lower().startswith("câu trả lời"):
         normalized = f"Câu trả lời:\n\n{normalized}"
     return normalized
@@ -1424,7 +1705,7 @@ def _build_context(passages: List[Dict]) -> str:
         doc_title = p.get("document_title") or p.get("doc_number", "Văn bản pháp luật")
         chapter = (p.get("chapter") or "").strip()
         section = (p.get("section") or "").strip()
-        article_number = _normalize_article_number(p.get("article_number"))
+        article_number = normalize_article_number_canonical(p.get("article_number"))
         article_title = p.get("article_title", "")
         clause_number = p.get("clause_number")
         text = p.get("text_chunk", "")
@@ -1452,7 +1733,7 @@ def _extract_sources(passages: List[Dict]) -> List[Dict]:
     sources = []
     seen = set()
     for p in passages:
-        article_number = _normalize_article_number(p.get("article_number"))
+        article_number = normalize_article_number_canonical(p.get("article_number"))
         key = (p.get("doc_number"), article_number)
         if key in seen:
             continue

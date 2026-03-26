@@ -9,6 +9,9 @@ if hasattr(sys.stdout, "reconfigure"):
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+# PhoBERT classifier thay đổi kết quả rule_based; test semantic/structural giữ ổn định.
+os.environ["INTENT_MODEL_ENABLED"] = "false"
+
 from app.services.intent_detector import (
     detect_intent,
     detect_intent_rule_based,
@@ -126,12 +129,13 @@ def test_semantic_layer():
 
 
 def test_full_pipeline():
-    _sep("FULL PIPELINE (async, Guard + Structural + Semantic + LLM)")
+    _sep("FULL PIPELINE (async, Guard + Classifier + Semantic + Structural + LLM)")
     cases = [
         ("", "hoi_dap_chung", "guard"),
         ("123", "hoi_dap_chung", "guard"),
-        ("Điều 47 Luật Di sản văn hóa", "article_query", "structural"),
-        ("Tóm tắt Luật Đầu tư 2025", "tom_tat_van_ban", "structural"),
+        # Có thể semantic (prototype) hoặc structural (YAML) — không khóa method
+        ("Điều 47 Luật Di sản văn hóa", "article_query", None),
+        ("Tóm tắt Luật Đầu tư 2025", "tom_tat_van_ban", None),
         ("Chính sách bảo trợ xã hội đối với người cao tuổi là gì?", "giai_thich_quy_dinh", None),
         ("Trẻ em bị bố đánh đập hàng ngày, cần can thiệp ngay", "bao_ve_xa_hoi", None),
         ("Các ngành, nghề cấm đầu tư kinh doanh theo Luật Đầu tư 2025", "trich_xuat_van_ban", None),

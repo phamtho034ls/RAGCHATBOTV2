@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 
 from app.config import SUMMARIZE_PROMPT, COPILOT_SYSTEM_PROMPT
 from app.database.models import Document, Article
@@ -22,6 +23,24 @@ from app.services.llm_client import generate
 from app.services.retrieval import search_all, format_sources, rewrite_query
 
 log = logging.getLogger(__name__)
+
+
+def _select_document_for_lookup():
+    """SELECT không lấy ``law_intents`` — DB chưa alembic upgrade vẫn khớp schema cũ."""
+    return select(Document).options(
+        load_only(
+            Document.id,
+            Document.doc_number,
+            Document.title,
+            Document.document_type,
+            Document.issuer,
+            Document.issued_date,
+            Document.effective_date,
+            Document.file_path,
+            Document.created_at,
+        )
+    )
+
 
 _DOC_TYPE_MAP = {
     "luật": "Luật",
@@ -64,7 +83,7 @@ async def _find_document(query: str) -> Optional[Document]:
         if m:
             raw_ref = (m.group(1) or m.group(2)).replace("_", "/")
             normalized = _strip_diacritics_simple(raw_ref).upper()
-            stmt = select(Document).where(
+            stmt = _select_document_for_lookup().where(
                 func.upper(Document.doc_number).like(f"%{normalized}%")
             ).limit(1)
             row = (await db.execute(stmt)).scalar()
@@ -72,7 +91,7 @@ async def _find_document(query: str) -> Optional[Document]:
                 return row
             num_prefix = re.match(r"(\d+/\d{4})", raw_ref)
             if num_prefix:
-                stmt = select(Document).where(
+                stmt = _select_document_for_lookup().where(
                     Document.doc_number.like(f"{num_prefix.group(1)}%")
                 ).limit(1)
                 row = (await db.execute(stmt)).scalar()
@@ -99,7 +118,7 @@ async def _find_document(query: str) -> Optional[Document]:
                 break
 
         if title_keywords:
-            stmt = select(Document)
+            stmt = _select_document_for_lookup()
             for kw in title_keywords[:5]:
                 if len(kw) >= 2:
                     stmt = stmt.where(Document.title.ilike(f"%{kw}%"))
@@ -109,7 +128,7 @@ async def _find_document(query: str) -> Optional[Document]:
                 return row
 
             if len(title_keywords) > 1:
-                stmt = select(Document).where(
+                stmt = _select_document_for_lookup().where(
                     Document.title.ilike(f"%{title_keywords[0]}%")
                 )
                 for kw in title_keywords[1:3]:
@@ -221,3 +240,83 @@ async def summarize_document(
 
     sources = format_sources(results)
     return {"summary": summary, "sources": sources}
+
+
+async def summarize_matched_document(
+    query: str,
+    temperature: float = 0.25,
+    max_chars: int = 22000,
+) -> Dict[str, Any]:
+    """Summarize the whole matched legal document (article coverage first)."""
+    doc = await _find_document(query)
+    if not doc:
+        return {
+            "summary": "Không tìm thấy văn bản phù hợp trong cơ sở dữ liệu.",
+            "sources": [],
+            "confidence_score": 0.0,
+        }
+
+    async with _session_factory() as db:
+        stmt = (
+            select(Article.article_number, Article.title, Article.content)
+            .where(Article.document_id == doc.id)
+            .order_by(Article.id)
+        )
+        rows = (await db.execute(stmt)).all()
+
+    if not rows:
+        return {
+            "summary": f"Không có điều khoản để tóm tắt cho văn bản {doc.doc_number or doc.title}.",
+            "sources": [{
+                "doc_number": doc.doc_number or "",
+                "document_title": doc.title or "",
+                "document_type": doc.document_type or "",
+            }],
+            "confidence_score": 0.4,
+        }
+
+    parts: List[str] = []
+    char_count = 0
+    for art_no, art_title, art_content in rows:
+        seg = f"[{art_no or ''} - {art_title or ''}]\n{(art_content or '').strip()}\n"
+        if char_count + len(seg) > max_chars:
+            break
+        parts.append(seg)
+        char_count += len(seg)
+
+    document_text = "\n".join(parts).strip()
+    if not document_text:
+        return {
+            "summary": "Không đủ nội dung văn bản để tóm tắt.",
+            "sources": [{
+                "doc_number": doc.doc_number or "",
+                "document_title": doc.title or "",
+                "document_type": doc.document_type or "",
+            }],
+            "confidence_score": 0.3,
+        }
+
+    prompt = (
+        f"TÓM TẮT VĂN BẢN PHÁP LUẬT SAU THEO DẠNG CÓ CẤU TRÚC:\n"
+        f"- Phạm vi điều chỉnh\n"
+        f"- Đối tượng áp dụng\n"
+        f"- Nhóm quy định chính\n"
+        f"- Điểm cần lưu ý khi thực thi\n\n"
+        f"Văn bản: {doc.title or ''} ({doc.doc_number or ''})\n\n"
+        f"Nội dung trích từ các điều:\n{document_text}"
+    )
+    summary = await generate(
+        prompt=prompt,
+        system=COPILOT_SYSTEM_PROMPT,
+        temperature=min(max(temperature, 0.0), 0.35),
+    )
+
+    return {
+        "summary": summary,
+        "sources": [{
+            "doc_number": doc.doc_number or "",
+            "document_title": doc.title or "",
+            "document_type": doc.document_type or "",
+        }],
+        "confidence_score": 0.9,
+    }

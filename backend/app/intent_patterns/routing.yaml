@@ -1,0 +1,326 @@
+# Intent 18 nhãn (gộp từ 23): structural_rules + routing + prototype_sentences.
+# document_metadata + document_relation → document_meta_relation
+# thu_tuc_hanh_chinh → huong_dan_thu_tuc
+# bao_ve_xa_hoi + bao_ton_phat_trien + program_goal → giai_thich_quy_dinh
+version: 2
+
+structural_rules:
+  # --- Điều khoản / số văn bản (ưu tiên cao) ---
+  - intent_id: article_query
+    priority: 102
+    confidence: 0.98
+    patterns:
+      - '(?i)\bđiều\s+\d+\b.*\b(luật|nghị\s*định|thông\s*tư|quyết\s*định|pháp\s*lệnh|chỉ\s*thị|nghị\s*quyết)\b'
+  - intent_id: article_query
+    priority: 101
+    confidence: 0.98
+    patterns:
+      - '(?i)\b(khoản|điểm)\s+\d+\s+.{0,24}\bđiều\s+\d+\b'
+  - intent_id: article_query
+    priority: 100
+    confidence: 0.97
+    patterns:
+      - 'điều\s+\d+\s+(luật|nghị\s*định|thông\s*tư|quyết\s*định|pháp\s*lệnh|chỉ\s*thị)'
+  - intent_id: article_query
+    priority: 99
+    confidence: 0.97
+    patterns:
+      - 'khoản\s+\d+\s+điều\s+\d+'
+  - intent_id: article_query
+    priority: 98
+    confidence: 0.96
+    patterns:
+      - '^\s*điều\s+\d+[\s,\.]*$'
+  - intent_id: article_query
+    priority: 97
+    confidence: 0.95
+    patterns:
+      - '(?i)\b(mục|chương)\s+[ivxlcdm\d]+\b.{0,40}\b(luật|nghị\s*định|thông\s*tư)\b'
+  - intent_id: article_query
+    priority: 96
+    confidence: 0.95
+    patterns:
+      - '\b\d{1,3}/\d{4}/[A-ZĐa-zđ\-]+\b'
+  - intent_id: article_query
+    priority: 95
+    confidence: 0.94
+    patterns:
+      - '\b\d{1,3}/[A-ZĐa-zđ]{2,}-[A-ZĐa-zđ]{2,}\b'
+  - intent_id: article_query
+    priority: 94
+    confidence: 0.93
+    patterns:
+      - '(?i)\bsố\s+[\d/.-]{4,}\b.{0,30}\b(nghị\s*định|quyết\s*định|thông\s*tư|luật)\b'
+
+  # --- Thủ tục / hồ sơ / mẫu / UBND (gộp thu_tuc_hanh_chinh → huong_dan_thu_tuc) ---
+  - intent_id: huong_dan_thu_tuc
+    priority: 93
+    confidence: 0.95
+    patterns:
+      - '(hướng\s*dẫn|chỉ\s*dẫn).{0,80}(thủ\s*tục|hồ\s*sơ|nộp|mẫu)'
+      - '(thủ\s*tục|quy\s*trình|trình\s*tự).{0,60}(nộp\s*hồ\s*sơ|mẫu\s*đơn|ở\s+đâu|thời\s*hạn|mấy\s*ngày)'
+      - '(mẫu\s*đơn|mẫu\s*công\s*văn|biểu\s*mẫu)'
+      - 'nộp\s+(hồ\s*sơ|đơn).{0,40}(ở\s+đâu|tại\s+đâu|qua\s+đâu)'
+      - '(một\s*cửa|dịch\s*vụ\s*công|tthc|thủ\s*tục\s*hành\s*chính)'
+      - '(đăng\s*ký|xin\s*phép|cấp\s*phép).{0,50}(lễ\s*hội|di\s*tích|tôn\s*giáo|biểu\s*diễn)'
+  - intent_id: huong_dan_thu_tuc
+    priority: 92
+    confidence: 0.94
+    patterns:
+      - '\bubnd\b|ủy\s*ban\s*nhân\s*dân|bộ\s*phận\s*một\s*cửa'
+
+  # --- Quan hệ / metadata văn bản → document_meta_relation ---
+  - intent_id: document_meta_relation
+    priority: 91
+    confidence: 0.95
+    patterns:
+      - '(ban\s*hành|có\s*hiệu\s*lực|hết\s*hiệu\s*lực)\s+(ngày|năm|khi|từ)\s+nào'
+      - '(ai|cơ\s*quan\s*nào)\s+(ban\s*hành|ký\s*ban\s*hành|phê\s*duyệt)'
+  - intent_id: document_meta_relation
+    priority: 90
+    confidence: 0.94
+    patterns:
+      - '(sửa\s*đổi|bổ\s*sung|thay\s*thế|bãi\s*bỏ|hướng\s*dẫn\s*thi\s*hành|mối\s*quan\s*hệ).{0,40}(văn\s*bản|luật|nghị\s*định)'
+
+  - intent_id: tom_tat_van_ban
+    priority: 89
+    confidence: 0.95
+    patterns:
+      - '(tóm\s*tắt|tổng\s*hợp|khái\s*quát)\s+(nghị\s*định|luật|thông\s*tư|quyết\s*định|chỉ\s*thị)'
+
+  - intent_id: so_sanh_van_ban
+    priority: 88
+    confidence: 0.95
+    patterns:
+      - 'so\s*sánh\s+.{0,30}(luật|nghị\s*định|thông\s*tư).{0,30}(và|với|so\s*với)'
+  - intent_id: so_sanh_van_ban
+    priority: 87
+    confidence: 0.94
+    patterns:
+      - '(phân\s*biệt|điểm\s*khác|khác\s*nhau|đối\s*chiếu)'
+
+  - intent_id: soan_thao_van_ban
+    priority: 86
+    confidence: 0.95
+    patterns:
+      - '(soạn|viết)\s+(công\s*văn|tờ\s*trình|biên\s*bản|quyết\s*định|thông\s*báo|đơn\s*xin)'
+      - '(lập|tạo)\s+(công\s*văn|tờ\s*trình|quyết\s*định|thông\s*báo|đơn\s*xin)'
+
+  - intent_id: tao_bao_cao
+    priority: 85
+    confidence: 0.95
+    patterns:
+      - '(tạo|viết|lập|soạn)\s+(báo\s*cáo)'
+
+  - intent_id: kiem_tra_ho_so
+    priority: 84
+    confidence: 0.95
+    patterns:
+      - '(đã\s+nộp|đã\s+có|đã\s+gửi).{0,50}(còn\s+thiếu|thiếu\s+gì|đủ\s+chưa)'
+
+  - intent_id: trich_xuat_van_ban
+    priority: 83
+    confidence: 0.95
+    patterns:
+      - '(trích\s*xuất|trích\s*dẫn|nguyên\s*văn)\s+'
+
+  - intent_id: can_cu_phap_ly
+    priority: 82
+    confidence: 0.95
+    patterns:
+      - 'căn\s*cứ\s+pháp\s*lý'
+      - '(viện\s*dẫn|dẫn\s*chiếu)\s+(văn\s*bản|quy\s*định)'
+
+  # --- Giải thích / chính sách / mức phạt / chế tài (gộp bảo vệ XH, bảo tồn, mục tiêu CT) ---
+  - intent_id: giai_thich_quy_dinh
+    priority: 81
+    confidence: 0.94
+    patterns:
+      - '(mức\s+(xử\s+)?phạt|mức\s+tiền\s+phạt|tiền\s+phạt|hình\s+thức\s+xử\s+phạt)'
+      - '(hành\s+vi\s+.*(cấm|nghiêm\s+cấm|vi\s+phạm)|nghiêm\s+cấm.{0,40}(hành\s+vi|quy\s*định))'
+  - intent_id: giai_thich_quy_dinh
+    priority: 80
+    confidence: 0.93
+    patterns:
+      - '(ai\s+chịu\s+trách\s+nhiệm|trách\s+nhiệm\s+(của|của\s+ai)|chế\s+tài|biện\s+pháp\s+(xử\s*lý|phòng\s+ngừa))'
+  - intent_id: giai_thich_quy_dinh
+    priority: 79
+    confidence: 0.92
+    patterns:
+      - '(được\s*hiểu|giải\s*thích|khái\s*niệm|là\s*gì|áp\s*dụng\s+như\s*thế\s*nào)'
+  - intent_id: giai_thich_quy_dinh
+    priority: 78
+    confidence: 0.91
+    patterns:
+      - '(mục\s*tiêu|mục\s*đích|nhằm\s+đạt|hướng\s+tới).{0,40}(chương\s*trình|đề\s*án|kế\s*hoạch)'
+  - intent_id: giai_thich_quy_dinh
+    priority: 77
+    confidence: 0.91
+    patterns:
+      - '(trợ\s*giúp\s*xã\s*hội|bảo\s*trợ\s*xã\s*hội|bạo\s*lực\s+gia\s*đình|bảo\s*vệ\s+trẻ\s*em|người\s+yếu\s+thế)'
+  - intent_id: giai_thich_quy_dinh
+    priority: 76
+    confidence: 0.90
+    patterns:
+      - '(bảo\s*tồn|tu\s*bổ|trùng\s*tu|di\s*tích|di\s*sản).{0,40}(quy\s*định|trách\s*nhiệm|điều\s*kiện)'
+
+  - intent_id: kiem_tra_thanh_tra
+    priority: 75
+    confidence: 0.90
+    patterns:
+      - '(thanh\s*tra|kiểm\s*tra).*(định\s*kỳ|đột\s*xuất|cơ\s*sở|chấp\s*hành)'
+
+  - intent_id: xu_ly_vi_pham_hanh_chinh
+    priority: 74
+    confidence: 0.93
+    patterns:
+      - '(xử\s*lý|xử\s*phạt).*(vi\s*phạm|trái\s*phép)'
+      - '(bị\s*phạt|phạt\s*bao\s*nhiêu)'
+
+  - intent_id: hoa_giai_van_dong
+    priority: 73
+    confidence: 0.90
+    patterns:
+      - '(hòa\s*giải|vận\s*động\s+nhân\s*dân|tuyên\s*truyền\s*vận\s*động)'
+
+  - intent_id: to_chuc_su_kien_cong
+    priority: 72
+    confidence: 0.90
+    patterns:
+      - '(tổ\s*chức|chuẩn\s*bị).*(sự\s*kiện|lễ\s*hội|ngày\s*hội|đại\s*hội)'
+
+  - intent_id: admin_planning
+    priority: 71
+    confidence: 0.88
+    patterns:
+      - '(kế\s*hoạch|phương\s*án|phân\s*bổ).{0,40}(quản\s*lý|nhân\s*sự|địa\s*bàn|triển\s*khai)'
+
+  - intent_id: tra_cuu_van_ban
+    priority: 70
+    confidence: 0.88
+    patterns:
+      - '(quy\s*định|quy\s*định\s+về|văn\s*bản\s+nào|luật\s+nào|nghị\s*định\s+nào)'
+
+routing:
+  multi_doc_synthesis:
+    - 'tổng\s+hợp'
+    - 'so\s+sánh'
+    - 'đối\s+chiếu'
+    - 'nêu\s+điểm\s+khác'
+    - 'giữa\s+.+\s+và\s+'
+    - 'và\s+các\s+nghị\s+định'
+    - 'nghị\s+định\s+hướng\s+dẫn'
+    - 'nằm\s+ở\s+những'
+    - 'những\s+luật'
+    - 'luật/nghị'
+    - 'luật\s*/\s*nghị'
+    - 'thông\s+tư\s+nào'
+    - 'nghị\s+định\s+nào'
+    - 'các\s+nghị\s+định.{0,120}hiện\s+hành'
+    - 'theo\s+các\s+văn\s+bản'
+    - 'văn\s+bản\s+pháp\s+luật.{0,160}điều\s+chỉnh'
+    - 'các\s+văn\s+bản\s+nào\s+quy\s+định'
+    - 'những\s+văn\s+bản\s+nào\s+quy\s+định'
+    - 'văn\s+bản\s+nào\s+quy\s+định'
+    - 'quy\s+định.{0,100}nằm\s+ở\s+những'
+  checklist_documents:
+    - 'liệt kê'
+    - 'danh sách'
+    - 'các văn bản'
+    - 'những văn bản'
+    - 'thống kê'
+    - 'bao nhiêu văn bản'
+    - 'cho biết các'
+    - 'kể tên'
+    - 'check\s*list'
+    - 'checklist'
+    - 'văn bản liên quan'
+    - 'văn bản nào'
+    - 'có những văn bản'
+  substantive_expansion:
+    - 'mức\s+(xử\s+)?phạt'
+    - 'mức\s+tiền\s+phạt'
+    - 'tiền\s+phạt'
+    - 'hình\s+thức\s+xử\s+phạt'
+    - 'chế\s+tài'
+    - 'hành\s+vi\s+.*(cấm|nghiêm\s+cấm|vi\s+phạm)'
+    - 'nghiêm\s+cấm'
+    - '\bcác\s+bước\b'
+    - 'quy\s+trình'
+    - 'trình\s+tự'
+    - 'thủ\s+tục'
+    - '\bhồ\s+sơ\b'
+    - 'giấy\s+tờ\s*(cần|có|phải)?'
+    - 'thành\s+phần\s+hồ\s+sơ'
+    - 'nêu\s+đầy\s+đủ'
+    - 'trình\s+bày\s+chi\s+tiết'
+    - 'hướng\s+dẫn\s+chi\s+tiết'
+    - 'biện\s+pháp\s+phòng\s+ngừa'
+    - 'tiếp\s+nhận'
+    - 'xác\s+minh'
+    - 'can\s+thiệp'
+    - 'tin\s+báo'
+    - 'xâm\s+hại'
+    - 'bạo\s+hành'
+    - 'phối\s+hợp\s+liên\s+ngành'
+    - 'tu\s+bổ|trùng\s+tu'
+    - 'đăng\s+ký\s+.*(tổ\s+chức\s+)?lễ\s+hội'
+    - 'kiểm\s+tra\s+.*cơ\s+sở\s+kinh\s+doanh'
+    - 'vai\s+trò\s+của\s+ubnd'
+  consultation_advisory:
+    - '\btham\s*mưu\b'
+    - '\btư\s*vấn\b'
+    - '\bphối\s*hợp\b'
+    - 'ông/bà'
+    - '\bông\s+bà\b'
+    - '\bcán\s*bộ\b'
+    - '\bubnd\b'
+    - 'ủy\s*ban\s*nhân\s*dân'
+    - '\bđảng\s*ủy\b'
+    - '\bhđnd\b'
+    - 'hội\s*đồng\s*nhân\s*dân'
+    - 'kế\s*hoạch'
+    - 'nghị\s*quyết'
+    - 'xử\s*lý\s*tình\s*huống'
+    - 'xin\s*chỉ\s*đạo'
+    - 'nên\s+làm\s+gì'
+    - 'làm\s+thế\s+nào\s+để'
+    - 'đảm\s*bảo\s+an\s+ninh'
+    - 'an\s+ninh\s+trật\s+tự'
+    - 'truyền\s+dạy'
+    - 'bảo\s+tồn\s+di\s+sản'
+    - 'địa\s+phương\s+có'
+    - 'tham\s*mưu\s+cho'
+    - 'ban\s+hành\s+nghị\s*quyết'
+  multi_article_boost_substantive:
+    - 'mức\s+(xử\s+)?phạt|hành\s+vi\s+.*cấm|nghiêm\s+cấm|biện\s+pháp\s+phòng\s+ngừa'
+
+# prototype_sentences: bổ sung biến thể câu cũ (merge nhóm đã gộp)
+prototype_sentences:
+  document_meta_relation:
+    - "Nghị định 36/2019 do cơ quan nào ban hành?"
+    - "Luật Di sản văn hóa có hiệu lực từ ngày nào?"
+    - "Luật nào sửa đổi Luật Di sản văn hóa 2001?"
+    - "Nghị định 36/2019 thay thế nghị định nào?"
+    - "Văn bản nào bãi bỏ Thông tư 04/2010?"
+    - "Thông tư 13/2024 còn hiệu lực không?"
+    - "Ai ký ban hành Quyết định 706?"
+  huong_dan_thu_tuc:
+    - "Thủ tục xin phép tổ chức lễ hội dân gian cấp xã"
+    - "Hồ sơ đăng ký sinh hoạt tôn giáo tập trung"
+    - "Thủ tục xin cấp phép tu bổ ngôi đình cổ"
+    - "Đăng ký hoạt động biểu diễn nghệ thuật tại xã"
+    - "Mẫu đơn xin cấp giấy phép kinh doanh có ở đâu?"
+    - "Nộp hồ sơ một cửa xã trong thời hạn bao lâu?"
+    - "UBND xã tiếp nhận hồ sơ công chứng vào ngày nào?"
+  giai_thich_quy_dinh:
+    - "Chính sách bảo trợ xã hội đối với người cao tuổi là gì?"
+    - "Mục tiêu chương trình mục tiêu quốc gia nông thôn mới?"
+    - "Trẻ em bị bố đánh đập hàng ngày, cần can thiệp ngay"
+    - "Ngôi chùa cổ bị hư hỏng sau bão, cần trùng tu theo quy định nào?"
+    - "Bảo tồn làng nghề truyền thống đan lát được quy định thế nào?"
+    - "An sinh xã hội bao gồm những gì?"
+    - "Đề án phát triển văn hóa 2030 nhằm mục đích gì?"
+  tra_cuu_van_ban:
+    - "Văn bản nào quy định về quản lý lễ hội dân gian?"
+    - "Có những nghị định nào về quảng cáo hiện hành?"

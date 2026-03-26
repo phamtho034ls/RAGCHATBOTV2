@@ -16,8 +16,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.database.session import init_db as init_postgres, close_db as close_postgres
 from app.pipeline.vector_store import ensure_collection
 from app.pipeline.embedding import warmup as warmup_embeddings
+from app.services.commune_route_arbiter import warmup_commune_route_index
 from app.retrieval.reranker import warmup as warmup_reranker
+from app.services.intent_pattern_config import load_intent_pattern_config
 from app.services.intent_detector import warmup_intent_index
+from app.services.intent_model_classifier import warmup_intent_classifier
 from app.services.domain_classifier import warmup_domain_index
 
 # ── v2 Routers ────────────────────────────────────────────
@@ -52,6 +55,8 @@ async def lifespan(app: FastAPI):
     # 2. Embedding model warm-up (trước Qdrant để tạo collection đúng chiều vector)
     warmup_embeddings()
     log.info("Embedding model ready.")
+    warmup_commune_route_index()
+    log.info("Commune route prototype index ready.")
 
     # 3. Qdrant collection
     ensure_collection()
@@ -61,9 +66,12 @@ async def lifespan(app: FastAPI):
     warmup_reranker()
     log.info("Reranker model ready.")
 
-    # 5. Intent prototype semantic index (dùng cho detect_intent + get_rag_intents)
+    # 5. Intent YAML (structural + routing) rồi prototype semantic index
+    load_intent_pattern_config()
     warmup_intent_index()
     log.info("Intent semantic index ready.")
+    warmup_intent_classifier()
+    log.info("Intent PhoBERT classifier warm-up attempted.")
 
     # 6. Legal domain classification index
     warmup_domain_index()

@@ -31,7 +31,7 @@ from app.pipeline.db_writer import (
 from app.pipeline.embedding import embed_texts
 from app.pipeline.legal_parser import build_article_tree
 from app.pipeline.vector_store import upsert_vectors
-from app.services.domain_classifier import classify_document_domain
+from app.services.domain_classifier import classify_document_law_intents
 
 log = logging.getLogger(__name__)
 
@@ -376,12 +376,15 @@ async def ingest_document(
     if not doc_title:
         doc_title = _title_from_filename(filename) or _extract_title(cleaned, doc_type)
 
-    legal_domain = classify_document_domain(doc_title, cleaned[:1000])
+    # Chỉ tiêu đề + trích yếu (không lấy thân văn dài) để tránh gán nhãn theo từ khóa lạc ngữ cảnh (vd. "trẻ em" trong điều khác).
+    snippet_for_intents = ((trich_yeu or "")[:1800] or cleaned[:900]).strip()
+    law_intents = classify_document_law_intents(doc_title, snippet_for_intents)
+    legal_domain = law_intents[0] if law_intents else "chung"
     total_clauses_in_tree = sum(len(a.clauses) for a in structure.articles) if structure.articles else 0
     log.info(
-        "  [3/9 STRUCTURE] '%s' → type='%s', domain='%s', articles=%d, clauses_in_tree=%d, "
+        "  [3/9 STRUCTURE] '%s' → type='%s', domain='%s', law_intents=%s, articles=%d, clauses_in_tree=%d, "
         "title='%.60s', issuer='%.40s', issued=%s, effective=%s",
-        filename, doc_type, legal_domain, len(structure.articles), total_clauses_in_tree,
+        filename, doc_type, legal_domain, law_intents, len(structure.articles), total_clauses_in_tree,
         doc_title, issuer_value,
         issued_date_value or "N/A", effective_date_value or "N/A",
     )
@@ -407,6 +410,7 @@ async def ingest_document(
         issued_date=issued_date_value,
         effective_date=effective_date_value,
         file_path=str(file_path),
+        law_intents=law_intents,
     )
     document_id = doc.id
     log.info("  [4/9 DB-DOC] '%s' → document_id=%d", filename, document_id)
@@ -490,6 +494,7 @@ async def ingest_document(
             "doc_number": doc_number,
             "document_type": doc_type,
             "legal_domain": legal_domain,
+            "law_intents": law_intents,
             "article_number": chunk.article_number,
             "article_title": chunk.article_title,
             "clause_number": chunk.clause_number,

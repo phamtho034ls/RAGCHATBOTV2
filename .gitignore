@@ -54,3 +54,10 @@ node_modules/
 .next/
 out/
 backend/app/storage/
+
+# =========================
+# Database
+# =========================
+data_clean.json
+data.json
+backend/tests/

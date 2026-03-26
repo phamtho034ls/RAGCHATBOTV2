@@ -4,16 +4,25 @@ intent và trích xuất metadata filters, hỗ trợ pipeline RAG retrieval.
 
 Pipeline tích hợp:
     User Query
-    → QueryUnderstanding.analyze_query()
-    → Extract intent + metadata filters + keywords
-    → FAISS search → Metadata filtering → Reranker → Top context → LLM
+    → analyze_query() → compute_intent_bundle + filters/keywords/sort
+    → hybrid retrieval (PostgreSQL + Qdrant) → Reranker → LLM
 """
 
 from __future__ import annotations
 
-import re
 import logging
 from typing import Any, Dict, List, Optional
+
+from app.services.query_intent import compute_intent_bundle
+from app.services.query_text_patterns import (
+    detect_sort_from_patterns,
+    document_type_luat_is_false_positive,
+    document_type_quyet_dinh_is_false_positive,
+    extract_article_number_from_user_query,
+    extract_year_from_query_text,
+    match_first_mapping_value,
+    tokenize_query_words_alnum,
+)
 
 log = logging.getLogger(__name__)
 
@@ -30,134 +39,7 @@ class QueryUnderstanding:
     # ================================================================
     #  Bảng ánh xạ keyword → giá trị chuẩn hóa
     # ================================================================
-
-    # Từ khóa nhận diện intent
-    INTENT_PATTERNS: Dict[str, List[str]] = {
-        "document_summary": [
-            r"(luật|nghị\s*định|thông\s*tư|quyết\s*định|văn bản)\s+.*\b(bao gồm|gồm có|gồm những|có những)\b",
-            r"(luật|nghị\s*định|thông\s*tư|quyết\s*định)\s+.*\b(nội dung|quy định)\s+(gì|những gì|nào)",
-            r"\b(tóm tắt|tổng quan|mục lục|danh sách các điều)\b\s+.*(luật|nghị\s*định|thông\s*tư|văn bản)",
-            r"(luật|nghị\s*định|thông\s*tư|quyết\s*định)\s+.*\bcó\s+(bao nhiêu|mấy)\s+(điều|chương)",
-            r"\b(các điều|những điều|các chương)\b\s+.*(luật|nghị\s*định|thông\s*tư)",
-            r"(luật|nghị\s*định|thông\s*tư|quyết\s*định)\s+.*\b(gồm|bao gồm)\b",
-            r"\d+[/_]\d{4}[/_]\S+\s+.*(bao gồm|gồm|quy định\s+(gì|những gì|nào))",
-            r"(liệt kê|cho biết)\s+(các\s+)?(điều\s+)(trong\s+)?(luật|nghị\s*định|thông\s*tư)",
-        ],
-        "article_query": [
-            r"điều\s+\d+\s+(quy định|nêu|nói|ghi)",
-            r"(quy định|nội dung)\s+(của\s+)?điều\s+\d+",
-            r"(cấm|cho phép|bắt buộc)\s+.*(sản phẩm|hành vi|hoạt động)",
-        ],
-        "document_metadata": [
-            r"ban hành\s+(ngày|năm|khi)\s+nào",
-            r"(ngày|năm)\s+ban hành",
-            r"(ai|cơ quan nào)\s+ban hành",
-            r"(số hiệu|số)\s+(văn bản|quyết định|nghị định|thông tư)",
-            r"(quyết định|nghị định|thông tư|luật)\s+.*(ban hành|có hiệu lực|hết hiệu lực)\s+.*(ngày|năm|khi|bao giờ)",
-            r"(hiệu lực|có hiệu lực|hết hiệu lực)\s+(từ|ngày|khi)\s+nào",
-        ],
-        "program_goal": [
-            r"mục tiêu\s+(của\s+)?(chương trình|đề án|kế hoạch|dự án)",
-            r"(chương trình|đề án|kế hoạch|dự án)\s+.*(mục tiêu|mục đích|nhằm)",
-            r"(mục đích|mục tiêu|nhiệm vụ)\s+(chính|chủ yếu|cơ bản)\s+(của|là)",
-        ],
-        "document_relation": [
-            r"(sửa đổi|bổ sung|thay thế|bãi bỏ)\s+(những|các)?\s*(luật|nghị định|thông tư|văn bản|quy định)",
-            r"(luật|nghị định|thông tư)\s+.*(sửa đổi|bổ sung|thay thế)\s+(những|các)?\s*(luật|nghị định|thông tư|văn bản)",
-            r"(văn bản|luật)\s+(nào|gì)\s+(bị|được)\s+(sửa đổi|thay thế|bãi bỏ)",
-        ],
-        "checklist_documents": [
-            r"liệt kê", r"danh sách", r"các văn bản", r"những văn bản",
-            r"tổng hợp", r"thống kê", r"bao nhiêu văn bản",
-            r"cho biết các", r"kể tên",
-            r"check\s*list", r"checklist", r"văn bản liên quan",
-            r"văn bản nào", r"có những văn bản",
-        ],
-        "can_cu_phap_ly": [
-            r"căn cứ", r"dựa (vào|trên|theo)\s+(luật|văn bản|quy định)",
-            r"cơ sở pháp lý", r"căn cứ pháp lý",
-            r"văn bản (trên|đó|này)\s+(dựa|căn cứ)",
-            r"(dựa|căn cứ)\s+(vào|theo)\s+luật nào",
-            r"luật nào (quy định|điều chỉnh|áp dụng)",
-            r"theo luật nào", r"căn cứ vào đâu",
-        ],
-        "document_drafting": [
-            r"soạn thảo", r"viết mẫu", r"tạo văn bản", r"mẫu đơn",
-            r"biên bản", r"tờ trình", r"công văn mẫu", r"dự thảo",
-            r"lập văn bản", r"viết công văn",
-            r"soạn (kế hoạch|quyết định|thông báo|báo cáo)",
-        ],
-        "giai_thich_quy_dinh": [
-            r"giải thích", r"nghĩa là (gì|sao)",
-            r"hiểu (như thế nào|thế nào|ra sao)",
-            r"có nghĩa", r"ý nghĩa",
-            r"áp dụng (như thế nào|thế nào|ra sao)",
-            r"tại sao", r"vì sao", r"phân tích", r"diễn giải",
-        ],
-        "admin_planning": [
-            r"(lập|xây dựng|soạn)\s+(kế hoạch|phương án)\s+(quản lý|triển khai|thực hiện)",
-            r"(tổ chức|triển khai)\s+(thực hiện|quản lý)\s+.*(tại|ở|trên địa bàn)",
-            r"(bố trí|phân bổ)\s+(nhân (sự|lực)|nguồn lực|cán bộ|biên chế)",
-            r"(cơ cấu|tổ chức)\s+(bộ máy|nhân sự|chính quyền)",
-            r"(quy hoạch|kế hoạch)\s+(quản lý|phát triển|triển khai|sử dụng)",
-            r"(giám sát|kiểm tra)\s+(việc\s+)?(thực hiện|triển khai|quản lý)",
-            r"(biện pháp|giải pháp)\s+(quản lý|tổ chức|triển khai)",
-            r"quản lý\s+(hành chính|nhà nước)\s+.*(tại|ở|trên)",
-        ],
-        "legal_lookup": [
-            r"quy định", r"điều\s+\d+", r"khoản\s+\d+", r"luật\s+",
-            r"nghị định", r"thông tư", r"chức năng", r"nhiệm vụ",
-            r"quyền hạn", r"trách nhiệm", r"thẩm quyền", r"xử phạt",
-            r"chế tài", r"hướng dẫn", r"theo quy định", r"pháp luật",
-            r"căn cứ", r"cơ sở pháp lý", r"điều kiện", r"thủ tục",
-            r"quy trình", r"UBND", r"ủy ban",
-            r"quy định mới nhất", r"hiện hành", r"còn hiệu lực",
-        ],
-        # ── Commune-level intents (Cán bộ VHXH cấp xã) ──────
-        "xu_ly_vi_pham_hanh_chinh": [
-            r"karaoke\s+(gây|ồn|tiếng\s+ồn|quá\s+giờ)",
-            r"(gây|tiếng)\s+ồn",
-            r"vi phạm\s+(hành chính|quảng cáo|văn hóa|lễ hội)",
-            r"xử phạt\s+(hành chính|vi phạm|karaoke|tiếng ồn)",
-            r"(internet|game)\s+.*(vi phạm|không phép|học sinh)",
-            r"mê tín\s+dị\s+đoan",
-        ],
-        "kiem_tra_thanh_tra": [
-            r"kiểm tra\s+(cơ sở|quán|karaoke|internet|game|dịch vụ)",
-            r"thanh tra\s+(văn hóa|cơ sở|hoạt động)",
-            r"(đoàn|tổ)\s+kiểm tra",
-            r"(rà soát|kiểm tra)\s+(định kỳ|đột xuất)",
-        ],
-        "thu_tuc_hanh_chinh": [
-            r"(đăng ký|xin phép|cấp phép)\s+(lễ hội|biểu diễn|sự kiện|quảng cáo)",
-            r"(tu bổ|tôn tạo|sửa chữa)\s+(di tích|đình|chùa|miếu)",
-            r"đăng ký\s+(hoạt động|sinh hoạt)\s+tôn giáo",
-            r"công nhận\s+(di tích|di sản|làng văn hóa|gia đình văn hóa)",
-        ],
-        "hoa_giai_van_dong": [
-            r"hòa giải\s+(tranh chấp|mâu thuẫn|xung đột)",
-            r"vận động\s+(người dân|nhân dân|cộng đồng)",
-            r"(xây dựng|thực hiện)\s+(nếp sống|đời sống)\s+(văn hóa|văn minh)",
-            r"(hương ước|quy ước)\s+(thôn|xóm|khu dân cư)",
-        ],
-        "bao_ve_xa_hoi": [
-            r"bạo lực\s+gia đình",
-            r"(xâm hại|bạo hành|ngược đãi)\s+(trẻ em|phụ nữ|người già)",
-            r"(trẻ em|học sinh)\s+(bỏ học|lang thang|chơi game|nghiện)",
-            r"(phòng chống|ngăn chặn)\s+(bạo lực gia đình|tệ nạn)",
-        ],
-        "to_chuc_su_kien_cong": [
-            r"(tổ chức|chuẩn bị)\s+(lễ hội|sự kiện|hội thi|hội diễn)",
-            r"(lễ hội|sự kiện)\s+(văn hóa|thể thao|truyền thống)",
-            r"(biểu diễn|văn nghệ)\s+(công cộng|quần chúng)",
-        ],
-        "bao_ton_phat_trien": [
-            r"(bảo tồn|gìn giữ|phát huy)\s+(di sản|di tích|văn hóa)",
-            r"(đình|chùa|miếu)\s+.*(xuống cấp|tu bổ|tôn tạo)",
-            r"(làng nghề|nghề truyền thống)\s+.*(bảo tồn|phát triển)",
-        ],
-        # general_question là default, không cần pattern
-    }
+    # Intent / routing: ``compute_intent_bundle`` + ``intent_detector`` (không regex intent tại đây).
 
     # Ánh xạ lĩnh vực (field)
     FIELD_MAP: Dict[str, List[str]] = {
@@ -302,7 +184,15 @@ class QueryUnderstanding:
             r"cán bộ", r"công chức", r"viên chức",
             r"UBND", r"ủy ban", r"chính quyền",
         ],
-        "phu_nu": [r"phụ nữ", r"người vợ", r"người mẹ", r"nạn nhân bạo lực"],
+        "phu_nu": [
+            r"phụ nữ",
+            r"người vợ",
+            r"vợ\s+đánh",
+            r"người mẹ",
+            r"nạn nhân bạo lực",
+            r"\bvợ\b.*\bchồng\b",
+            r"\bchồng\b.*\bvợ\b",
+        ],
         "nguoi_cao_tuoi": [r"người già", r"người cao tuổi", r"cụ già", r"neo đơn"],
     }
 
@@ -320,8 +210,20 @@ class QueryUnderstanding:
             r"đốt vàng mã", r"chen lấn xô đẩy",
         ],
         "bao_luc_gia_dinh": [
-            r"bạo lực gia đình", r"đánh đập", r"hành hạ",
-            r"bạo hành", r"ngược đãi", r"xâm hại",
+            r"bạo lực gia đình",
+            r"đánh đập",
+            r"hành hạ",
+            r"bạo hành",
+            r"ngược đãi",
+            r"xâm hại",
+            r"vợ\s+đánh\s+chồng",
+            r"chồng\s+đánh\s+vợ",
+            r"\bđánh\s+chồng\b",
+            r"\bđánh\s+vợ\b",
+            r"đánh\s+nhau",
+            r"thương\s+tích",
+            r"bạo\s+hành\s+gia\s+đình",
+            r"mâu\s+thuẫn",
         ],
         "kinh_doanh_trai_phep": [
             r"không phép", r"không giấy phép", r"chưa đăng ký",
@@ -373,31 +275,13 @@ class QueryUnderstanding:
     #  Phương thức chính
     # ================================================================
 
+    def _resolve_routing_intent(self, query: str) -> str:
+        """Routing intent — cùng logic với ``compute_intent_bundle`` (query_intent)."""
+        return compute_intent_bundle(query)["routing_intent"]
+
     def detect_intent(self, query: str) -> str:
-        """
-        Phân loại ý định (intent) câu hỏi dựa trên keyword matching.
-
-        Trả về một trong:
-            - "checklist_documents": liệt kê văn bản
-            - "document_drafting": soạn thảo văn bản
-            - "legal_lookup": tra cứu pháp luật
-            - "general_question": câu hỏi chung
-
-        Ưu tiên theo thứ tự: checklist > drafting > legal > general.
-        """
-        query_lower = query.lower()
-
-        # Duyệt theo thứ tự ưu tiên
-        for intent, patterns in self.INTENT_PATTERNS.items():
-            for pattern in patterns:
-                if re.search(pattern, query_lower):
-                    # Guard: "Điều X" in query → article_query, not summary
-                    if intent == "document_summary" and re.search(r"điều\s+\d+", query_lower):
-                        return "article_query"
-                    log.debug("Intent detected: %s (matched: %s)", intent, pattern)
-                    return intent
-
-        return "general_question"
+        """Intent routing cho RAG (checklist + detector + map)."""
+        return self._resolve_routing_intent(query)
 
     def extract_metadata_filters(self, query: str) -> Dict[str, Any]:
         """
@@ -414,47 +298,41 @@ class QueryUnderstanding:
         filters: Dict[str, Any] = {}
 
         # Trích xuất lĩnh vực
-        field = self._match_first(query_lower, self.FIELD_MAP)
+        field = match_first_mapping_value(query_lower, self.FIELD_MAP)
         if field:
             filters["field"] = field
 
         # Trích xuất cấp chính quyền
-        gov_level = self._match_first(query_lower, self.GOVERNMENT_LEVEL_MAP)
+        gov_level = match_first_mapping_value(query_lower, self.GOVERNMENT_LEVEL_MAP)
         if gov_level:
             filters["government_level"] = gov_level
 
         # Trích xuất loại văn bản (tránh nhầm cụm hành chính / ngữ pháp)
-        doc_type = self._match_first(query_lower, self.DOCUMENT_TYPE_MAP)
-        if doc_type == "quyet_dinh" and re.search(
-            r"thẩm quyền\s+quyết định|quyền\s+quyết định|được\s+quyết định",
-            query_lower,
-        ):
+        doc_type = match_first_mapping_value(query_lower, self.DOCUMENT_TYPE_MAP)
+        if doc_type == "quyet_dinh" and document_type_quyet_dinh_is_false_positive(query_lower):
             doc_type = None  # "quyết định" = thẩm quyền/xử lý, không phải văn bản "Quyết định"
-        if doc_type == "luat" and re.search(
-            r"điều\s+luật|các\s+điều\s+luật|theo\s+điều\s+luật",
-            query_lower,
-        ):
+        if doc_type == "luat" and document_type_luat_is_false_positive(query_lower):
             doc_type = None  # "điều luật" = cụm chỉ điều khoản, không phải loại "Luật"
         if doc_type:
             filters["document_type"] = doc_type
 
         # Trích xuất chức danh
-        position = self._match_first(query_lower, self.POSITION_MAP)
+        position = match_first_mapping_value(query_lower, self.POSITION_MAP)
         if position:
             filters["position"] = position
 
         # Trích xuất trạng thái hiệu lực
-        status = self._match_first(query_lower, self.STATUS_MAP)
+        status = match_first_mapping_value(query_lower, self.STATUS_MAP)
         if status:
             filters["status"] = status
 
         # Trích xuất năm ban hành
-        year = self._extract_year(query_lower)
+        year = extract_year_from_query_text(query_lower)
         if year:
             filters["year"] = year
 
         # Trích xuất article_number nếu có (e.g. "Điều 47")
-        article = self._extract_article_number(query)
+        article = extract_article_number_from_user_query(query)
         if article:
             filters["article_number"] = article
 
@@ -476,7 +354,8 @@ class QueryUnderstanding:
                 "sort": "relevance"
             }
         """
-        intent = self.detect_intent(query)
+        bundle = compute_intent_bundle(query)
+        intent = bundle["routing_intent"]
         filters = self.extract_metadata_filters(query)
         keywords = self._extract_keywords(query)
         sort_order = self._detect_sort(query)
@@ -486,17 +365,15 @@ class QueryUnderstanding:
 
         analysis = {
             "intent": intent,
+            "detector_intent": bundle["detector_intent"],
+            "rag_flags": bundle["rag_flags"],
             "filters": filters,
             "keywords": keywords,
             "sort": sort_order,
         }
 
         from app.services.intent_detector import COMMUNE_LEVEL_INTENTS
-        commune_intents_for_check = COMMUNE_LEVEL_INTENTS | {
-            "xu_ly_vi_pham_hanh_chinh", "kiem_tra_thanh_tra",
-            "thu_tuc_hanh_chinh", "hoa_giai_van_dong",
-            "bao_ve_xa_hoi", "to_chuc_su_kien_cong", "bao_ton_phat_trien",
-        }
+        commune_intents_for_check = set(COMMUNE_LEVEL_INTENTS)
         situation = self.analyze_commune_situation(query)
         has_commune_signal = (
             situation["violation"] != "không có"
@@ -512,45 +389,12 @@ class QueryUnderstanding:
     #  Helpers nội bộ
     # ================================================================
 
-    @staticmethod
-    def _match_first(
-        text: str,
-        mapping: Dict[str, List[str]],
-    ) -> Optional[str]:
-        """Tìm giá trị đầu tiên khớp pattern trong mapping."""
-        for value, patterns in mapping.items():
-            for pattern in patterns:
-                if re.search(pattern, text):
-                    return value
-        return None
-
-    @staticmethod
-    def _extract_year(text: str) -> Optional[int]:
-        """Trích xuất năm ban hành từ câu hỏi (ví dụ: năm 2023, 2024)."""
-        # Pattern: "năm YYYY" hoặc số năm đứng độc lập (2000-2099)
-        match = re.search(r"năm\s+(20\d{2})", text)
-        if match:
-            return int(match.group(1))
-        # Fallback: tìm năm đứng riêng biệt trong câu
-        match = re.search(r"\b(20\d{2})\b", text)
-        if match:
-            return int(match.group(1))
-        return None
-
-    @staticmethod
-    def _extract_article_number(query: str) -> Optional[str]:
-        """Trích xuất số Điều từ câu hỏi (ví dụ: 'Điều 47' → '47')."""
-        match = re.search(r"điều\s+(\d+[A-Za-z]?)", query, re.IGNORECASE)
-        if match:
-            return match.group(1)
-        return None
-
     def _extract_keywords(self, query: str) -> List[str]:
         """Trích xuất từ khóa quan trọng từ câu hỏi (loại bỏ stopwords)."""
         # Trích xuất cụm từ quan trọng (bigrams) trước
         bigrams = self._extract_bigrams(query)
         # Tách từ, loại bỏ dấu câu
-        words = re.findall(r"[\w]+", query.lower())
+        words = tokenize_query_words_alnum(query.lower())
         # Loại bỏ stopwords và từ quá ngắn (< 3 ký tự)
         keywords = [
             w for w in words
@@ -568,7 +412,7 @@ class QueryUnderstanding:
     @staticmethod
     def _extract_bigrams(query: str) -> List[str]:
         """Trích xuất cụm 2 từ liền kề có ý nghĩa."""
-        words = re.findall(r"[\w]+", query.lower())
+        words = tokenize_query_words_alnum(query.lower())
         bigrams = []
         # Các cụm từ quan trọng trong bối cảnh pháp luật VN
         important_bigrams = {
@@ -590,11 +434,8 @@ class QueryUnderstanding:
     def _detect_sort(self, query: str) -> str:
         """Phát hiện hướng sắp xếp kết quả mong muốn."""
         query_lower = query.lower()
-        for sort_type, patterns in self.SORT_PATTERNS.items():
-            for pattern in patterns:
-                if re.search(pattern, query_lower):
-                    return sort_type
-        return "relevance"
+        found = detect_sort_from_patterns(query_lower, self.SORT_PATTERNS)
+        return found or "relevance"
 
     def analyze_commune_situation(self, query: str) -> Dict[str, Any]:
         """Phân tích tình huống hành chính cấp xã.
@@ -605,9 +446,9 @@ class QueryUnderstanding:
             - severity: mức độ ảnh hưởng
         """
         query_lower = query.lower()
-        subject = self._match_first(query_lower, self.SUBJECT_MAP) or "không xác định"
-        violation = self._match_first(query_lower, self.VIOLATION_MAP) or "không có"
-        severity = self._match_first(query_lower, self.SEVERITY_MAP) or "chưa xác định"
+        subject = match_first_mapping_value(query_lower, self.SUBJECT_MAP) or "không xác định"
+        violation = match_first_mapping_value(query_lower, self.VIOLATION_MAP) or "không có"
+        severity = match_first_mapping_value(query_lower, self.SEVERITY_MAP) or "chưa xác định"
 
         return {
             "subject": subject,

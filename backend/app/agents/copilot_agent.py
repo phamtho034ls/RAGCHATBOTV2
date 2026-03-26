@@ -19,10 +19,16 @@ from typing import Any, AsyncGenerator, Dict, Optional
 
 from app.services.intent_detector import detect_intent
 from app.services.domain_guard import is_in_document_domain, looks_like_follow_up
-from app.services.rag_chain import rag_query_enhanced, rag_query_stream
 from app.services.query_router import route_query
 from app.memory.conversation_store import conversation_store
-from app.config import OUT_OF_DOMAIN_MESSAGE
+from app.config import (
+    OPENAI_API_KEY,
+    OUT_OF_DOMAIN_MESSAGE,
+    QUERY_UTTERANCE_CLASSIFIER_ENABLED,
+)
+from app.services.query_route_classifier import classify_user_utterance, UtteranceLabels
+from app.database.session import get_db_context
+from app.services.rag_unified import rag_query_unified, rag_query_stream_unified
 
 # Intent cần routing chuyên biệt (không dùng RAG thuần)
 SPECIALIZED_INTENTS = {
@@ -61,13 +67,26 @@ LEGAL_WEB_BLOCK_PATTERN = re.compile(
 )
 
 
-def _is_context_reference(question: str) -> bool:
-    """Check if question references previous context (e.g. 'văn bản trên')."""
+def _is_context_reference_regex(question: str) -> bool:
+    """Fallback regex: tham chiếu ngữ cảnh hội thoại."""
     q = question.lower().strip()
     return any(re.search(p, q) for p in CONTEXT_REFERENCE_PATTERNS)
 
 
-def _resolve_follow_up_question(question: str, conversation_id: Optional[str]) -> str:
+def _is_context_reference(
+    question: str,
+    labels: Optional[UtteranceLabels],
+) -> bool:
+    if labels is not None:
+        return bool(labels.references_prior_message_context)
+    return _is_context_reference_regex(question)
+
+
+def _resolve_follow_up_question(
+    question: str,
+    conversation_id: Optional[str],
+    labels: Optional[UtteranceLabels] = None,
+) -> str:
     """Bổ sung ngữ cảnh tài liệu cho câu hỏi nối tiếp.
 
     Handles two types of follow-up:
@@ -80,7 +99,7 @@ def _resolve_follow_up_question(question: str, conversation_id: Optional[str]) -
     ctx = conversation_store.get_context(conversation_id)
 
     # Check for document context reference
-    if _is_context_reference(question):
+    if _is_context_reference(question, labels):
         doc_ctx = conversation_store.get_last_document_context(conversation_id)
         if doc_ctx:
             # Build enriched question with document context
@@ -119,9 +138,15 @@ def _extract_document_metadata_from_answer(answer: str, question: str) -> Option
     return extract_document_metadata(question)
 
 
-def _is_legal_question(question: str) -> bool:
-    """Hard guard: legal questions must stay in Legal RAG only."""
+def _is_legal_question_regex(question: str) -> bool:
+    """Fallback: từ khóa pháp lý — không đưa sang web tổng quát."""
     return bool(LEGAL_WEB_BLOCK_PATTERN.search((question or "").strip()))
+
+
+def _is_legal_question(question: str, labels: Optional[UtteranceLabels]) -> bool:
+    if labels is not None:
+        return bool(labels.is_legal_or_admin_query)
+    return _is_legal_question_regex(question)
 
 
 async def _run_hybrid_general_search(question: str) -> Dict[str, Any]:
@@ -153,16 +178,21 @@ async def process(
 
     Pipeline:
         1. Lưu message vào conversation memory (nếu có)
-        2. Intent Detection (rule-based + LLM fallback)
-        3. Context Resolution (xử lý câu hỏi tham chiếu)
-        4. Smart Routing: nếu confidence >= threshold → route_query (chuyên biệt)
-           Nếu không → rag_query (standard)
-        5. Save document metadata (nếu là soạn thảo văn bản)
+        2. Intent: ``detect_intent`` (guard → structural → PhoBERT nếu bật → semantic → LLM)
+        3. Context Resolution (câu tham chiếu hội thoại)
+        4. Routing: intent chuyên biệt + confidence → ``route_query``; ngược lại → ``rag_query_unified`` (v2)
+        5. Lưu metadata văn bản (soạn thảo) nếu có
         6. Trả response kèm confidence + intent
     """
     # 1. Lưu user message
     if conversation_id:
         conversation_store.add_message(conversation_id, "user", question)
+
+    utterance_labels: Optional[UtteranceLabels] = None
+    if QUERY_UTTERANCE_CLASSIFIER_ENABLED and OPENAI_API_KEY:
+        utterance_labels = await classify_user_utterance(
+            question, has_conversation=bool(conversation_id)
+        )
 
     # 2. Detect intent
     intent_result = await detect_intent(question)
@@ -171,7 +201,7 @@ async def process(
     log.info("[LOG] intent=%s, confidence=%.2f, question=%s",
              intent, confidence, question[:80])
 
-    is_legal = _is_legal_question(question)
+    is_legal = _is_legal_question(question, utterance_labels)
     is_specialized = intent in SPECIALIZED_INTENTS and confidence >= 0.5
 
     # 2b. Hybrid web search (general, non-legal only): Wikipedia -> OpenAI web fallback
@@ -205,6 +235,8 @@ async def process(
             question=question,
             temperature=temperature,
             intent_override=intent_result,
+            conversation_id=conversation_id,
+            utterance_labels=utterance_labels,
         )
         answer = routed["answer"]
         sources = routed.get("sources", [])
@@ -219,13 +251,17 @@ async def process(
                 conversation_store.update_document_context(conversation_id, doc_meta)
                 log.info("[LOG] saved_document_context=%s", doc_meta)
     else:
-        # Resolve follow-up question with context
-        resolved_question = _resolve_follow_up_question(question, conversation_id)
-        rag_result = await rag_query_enhanced(
-            question=resolved_question,
-            temperature=temperature,
-            filters=filters,
+        resolved_question = _resolve_follow_up_question(
+            question, conversation_id, utterance_labels
         )
+        async with get_db_context() as db:
+            rag_result = await rag_query_unified(
+                resolved_question,
+                db,
+                temperature=temperature,
+                conversation_id=conversation_id,
+                utterance_labels=utterance_labels,
+            )
         answer = rag_result["answer"]
         sources = rag_result["sources"]
         query_analysis = rag_result.get("query_analysis")
@@ -240,7 +276,11 @@ async def process(
         conversation_store.add_message(conversation_id, "assistant", answer)
         if sources:
             first_meta = sources[0].get("metadata", {}) if sources else {}
-            last_topic = first_meta.get("title") or first_meta.get("source_file")
+            last_topic = (
+                first_meta.get("title")
+                or first_meta.get("law_name")
+                or first_meta.get("source_file")
+            )
             conversation_store.update_context(
                 conversation_id,
                 last_topic=last_topic,
@@ -272,12 +312,18 @@ async def process_stream(
     if conversation_id:
         conversation_store.add_message(conversation_id, "user", question)
 
+    utterance_labels: Optional[UtteranceLabels] = None
+    if QUERY_UTTERANCE_CLASSIFIER_ENABLED and OPENAI_API_KEY:
+        utterance_labels = await classify_user_utterance(
+            question, has_conversation=bool(conversation_id)
+        )
+
     # Detect intent (nhanh, trước khi stream)
     intent_result = await detect_intent(question)
     intent = intent_result["intent"]
     confidence = intent_result["confidence"]
     log.info("[LOG] stream: intent=%s, confidence=%.2f", intent, confidence)
-    is_legal = _is_legal_question(question)
+    is_legal = _is_legal_question(question, utterance_labels)
     is_specialized = intent in SPECIALIZED_INTENTS and confidence >= 0.5
 
     import json
@@ -314,6 +360,8 @@ async def process_stream(
             question=question,
             temperature=temperature,
             intent_override=intent_result,
+            conversation_id=conversation_id,
+            utterance_labels=utterance_labels,
         )
         answer = routed["answer"]
         routed_sources = routed.get("sources", [])
@@ -330,14 +378,19 @@ async def process_stream(
                 conversation_store.update_document_context(conversation_id, doc_meta)
                 log.info("[LOG] stream: saved_document_context=%s", doc_meta)
     else:
-        resolved_question = _resolve_follow_up_question(question, conversation_id)
-        async for token in rag_query_stream(
-            question=resolved_question,
-            temperature=temperature,
-            filters=filters,
-        ):
-            collected_tokens.append(token)
-            yield token
+        resolved_question = _resolve_follow_up_question(
+            question, conversation_id, utterance_labels
+        )
+        async with get_db_context() as db:
+            async for token in rag_query_stream_unified(
+                resolved_question,
+                db,
+                temperature=temperature,
+                conversation_id=conversation_id,
+                utterance_labels=utterance_labels,
+            ):
+                collected_tokens.append(token)
+                yield token
 
     # Lưu full response (bỏ token metadata đầu tiên)
     if conversation_id and collected_tokens:

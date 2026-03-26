@@ -34,3 +34,7 @@ def test_dynamic_max_articles_gap():
     # gap lớn → 1 nguồn
     p_wide = [_p(1, 0.9), _p(2, 0.5)]
     assert dynamic_max_articles(p_wide) == 1
+
+
+def test_dynamic_max_articles_amendment_query():
+    assert dynamic_max_articles([_p(1, 0.9)], "Luật sửa đổi bổ sung gì?") == 5

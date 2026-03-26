@@ -38,6 +38,7 @@ async def insert_document(
     issued_date: Optional[date],
     effective_date: Optional[date],
     file_path: str,
+    law_intents: Optional[List[str]] = None,
 ) -> Document:
     document = Document(
         doc_number=doc_number,
@@ -47,6 +48,7 @@ async def insert_document(
         issued_date=issued_date,
         effective_date=effective_date,
         file_path=file_path,
+        law_intents=law_intents,
     )
     db.add(document)
     await db.flush()

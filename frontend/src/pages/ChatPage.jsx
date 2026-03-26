@@ -1,18 +1,23 @@
 import React, { useState, useRef, useEffect } from "react";
-import { MessageSquareText, RefreshCw } from "lucide-react";
+import { MessageSquareText, RefreshCw, Loader2 } from "lucide-react";
 import ChatMessage from "../components/ChatMessage";
 import ChatInput from "../components/ChatInput";
 import TypingIndicator from "../components/TypingIndicator";
 import SourcesPanel from "../components/SourcesPanel";
-import { chatStream } from "../api/client";
+import { chatStream, createConversation, getConversationDetail } from "../api/client";
 
-export default function ChatPage({ datasetId, temperature, hasDatasets }) {
+export default function ChatPage({
+  conversationId,
+  temperature,
+  onConversationIdChange,
+  onNotifySidebar,
+}) {
   const [messages, setMessages] = useState([]);
   const [streaming, setStreaming] = useState(false);
   const [currentSources, setCurrentSources] = useState(null);
-  const [conversationId, setConversationId] = useState(null);
   const [lastMeta, setLastMeta] = useState(null);
   const [chatError, setChatError] = useState(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const bottomRef = useRef(null);
 
   const scrollToBottom = () => {
@@ -23,31 +28,78 @@ export default function ChatPage({ datasetId, temperature, hasDatasets }) {
     scrollToBottom();
   }, [messages, streaming]);
 
-  // Reset chat khi đổi dataset
   useEffect(() => {
-    setMessages([]);
-    setCurrentSources(null);
-    setConversationId(null);
-    setLastMeta(null);
+    if (!conversationId) {
+      setMessages([]);
+      setCurrentSources(null);
+      setLastMeta(null);
+      setChatError(null);
+      setHistoryLoading(false);
+      return;
+    }
+    let cancelled = false;
+    const cid = String(conversationId);
+    setHistoryLoading(true);
     setChatError(null);
-  }, [datasetId]);
+    getConversationDetail(cid)
+      .then((detail) => {
+        if (cancelled) return;
+        const msgs = (detail.messages || []).map((m) => ({
+          role: m.role === "assistant" ? "bot" : m.role,
+          content: m.content || "",
+        }));
+        setMessages(msgs);
+        setCurrentSources(null);
+        setLastMeta(null);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setChatError(err?.message || "Không tải được lịch sử hội thoại.");
+          setMessages([]);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setHistoryLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [conversationId]);
 
-  const handleNewChat = () => {
-    setMessages([]);
-    setCurrentSources(null);
-    setConversationId(null);
-    setLastMeta(null);
-    setChatError(null);
+  const handleNewChat = async () => {
+    try {
+      const c = await createConversation();
+      const id = c.id != null ? String(c.id) : "";
+      onConversationIdChange?.(id);
+      onNotifySidebar?.();
+      setMessages([]);
+      setCurrentSources(null);
+      setLastMeta(null);
+      setChatError(null);
+    } catch (e) {
+      setChatError(e.message || "Không tạo được hội thoại mới.");
+    }
   };
 
   const handleSend = async (question) => {
-    if (!hasDatasets) return;
+    setChatError(null);
 
-    // Thêm message user
+    let cid = conversationId != null ? String(conversationId) : "";
+    if (!cid) {
+      try {
+        const c = await createConversation();
+        cid = c.id != null ? String(c.id) : "";
+        onConversationIdChange?.(cid);
+        onNotifySidebar?.();
+      } catch (e) {
+        setChatError(e.message || "Không tạo được hội thoại.");
+        return;
+      }
+    }
+
     setMessages((prev) => [...prev, { role: "user", content: question }]);
     setStreaming(true);
     setCurrentSources(null);
-    setChatError(null);
 
     let botText = "";
 
@@ -55,13 +107,11 @@ export default function ChatPage({ datasetId, temperature, hasDatasets }) {
       await chatStream(
         question,
         temperature,
-        // onToken
         (token) => {
           botText += token;
           setMessages((prev) => {
             const copy = [...prev];
             const lastIdx = copy.length - 1;
-            // Update hoặc thêm bot message
             if (copy[lastIdx]?.role === "bot") {
               copy[lastIdx] = { ...copy[lastIdx], content: botText };
             } else {
@@ -70,18 +120,15 @@ export default function ChatPage({ datasetId, temperature, hasDatasets }) {
             return copy;
           });
         },
-        // onSources
         (sources) => {
           setCurrentSources(sources);
         },
-        // onDone
         () => {
           setStreaming(false);
         },
-        conversationId,
-        // onMeta
+        cid,
         (meta) => {
-          if (meta.conversation_id) setConversationId(meta.conversation_id);
+          if (meta.conversation_id) onConversationIdChange?.(String(meta.conversation_id));
           setLastMeta(meta);
           setMessages((prev) => {
             const copy = [...prev];
@@ -102,6 +149,28 @@ export default function ChatPage({ datasetId, temperature, hasDatasets }) {
             }
             return copy;
           });
+        },
+        (fin) => {
+          const text = fin.text ?? "";
+          botText = text;
+          setMessages((prev) => {
+            const copy = [...prev];
+            const lastIdx = copy.length - 1;
+            if (copy[lastIdx]?.role === "bot") {
+              copy[lastIdx] = {
+                ...copy[lastIdx],
+                content: text,
+                confidence: fin.confidence_score,
+                retried: fin.retried,
+              };
+            }
+            return copy;
+          });
+          setLastMeta({
+            conversation_id: cid,
+            confidence_score: fin.confidence_score,
+            retried: fin.retried,
+          });
         }
       );
     } catch (err) {
@@ -117,35 +186,12 @@ export default function ChatPage({ datasetId, temperature, hasDatasets }) {
     }
   };
 
-  // ── Empty state ──────────────────────────────────────────
-  if (!hasDatasets) {
-    return (
-      <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
-        <div className="flex-1 flex flex-col items-center justify-center text-center px-6">
-          <div className="w-16 h-16 rounded-2xl bg-primary-600/10 flex items-center justify-center mb-4">
-            <MessageSquareText size={32} className="text-primary-400" />
-          </div>
-          <h2 className="text-xl font-semibold text-gray-200 mb-2">
-            Chào mừng bạn đến với RAG Chatbot
-          </h2>
-          <p className="text-sm text-gray-500 max-w-sm">
-            Tải lên file tài liệu Word (.doc, .docx) từ thanh bên trái, sau đó đặt câu
-            hỏi để bắt đầu hỏi đáp thông minh.
-          </p>
-        </div>
-        <div className="px-4 md:px-8 lg:px-16 xl:px-32 pb-4 pt-2">
-          <ChatInput onSend={() => {}} disabled />
-          <p className="text-[10px] text-gray-600 text-center mt-2">
-            RAG Chatbot – Hỏi đáp dựa trên tài liệu • Chạy hoàn toàn local
-          </p>
-        </div>
-      </div>
-    );
-  }
+  const showGlobalEmpty = !conversationId && messages.length === 0 && !historyLoading;
+  const showConvEmpty =
+    conversationId && !historyLoading && messages.length === 0;
 
   return (
     <div className="flex-1 flex flex-col h-full min-h-0 overflow-hidden">
-      {/* Messages area */}
       <div className="flex-1 overflow-y-auto min-h-0 px-4 md:px-8 lg:px-16 xl:px-32 py-6 space-y-4">
         <div className="flex flex-wrap items-center gap-2 text-xs text-gray-500">
           <button
@@ -156,7 +202,9 @@ export default function ChatPage({ datasetId, temperature, hasDatasets }) {
             <RefreshCw size={12} /> Cuộc hội thoại mới
           </button>
           {conversationId && (
-            <span className="font-mono text-[10px] text-gray-600">ID: {conversationId}</span>
+            <span className="font-mono text-[10px] text-gray-600">
+              ID: {String(conversationId)}
+            </span>
           )}
           {lastMeta && typeof lastMeta.confidence_score === "number" && (
             <span>
@@ -170,44 +218,61 @@ export default function ChatPage({ datasetId, temperature, hasDatasets }) {
             {chatError}
           </div>
         )}
-        {messages.length === 0 && (
-          <div className="flex flex-col items-center justify-center h-full text-center">
+        {historyLoading && (
+          <div className="flex items-center justify-center gap-2 py-12 text-sm text-gray-500">
+            <Loader2 className="animate-spin" size={18} />
+            Đang tải lịch sử…
+          </div>
+        )}
+
+        {showGlobalEmpty && (
+          <div className="flex flex-col items-center justify-center min-h-[40vh] text-center">
             <div className="w-12 h-12 rounded-xl bg-primary-600/10 flex items-center justify-center mb-3">
               <MessageSquareText size={24} className="text-primary-400" />
             </div>
-            <p className="text-sm text-gray-500">
-              Đặt câu hỏi về nội dung tài liệu để bắt đầu…
+            <p className="text-sm text-gray-500 max-w-sm">
+              Chọn hoặc tạo cuộc hội thoại từ thanh bên, rồi đặt câu hỏi pháp luật. Bạn cũng có thể gửi tin nhắn
+              ngay — hệ thống sẽ tạo hội thoại mới nếu cần.
             </p>
           </div>
         )}
 
-        {messages.map((msg, i) => (
-          <React.Fragment key={i}>
-            <ChatMessage
-              role={msg.role}
-              content={msg.content}
-              confidence={msg.confidence}
-              retried={msg.retried}
-            />
-            {/* Show sources after bot message */}
-            {msg.role === "bot" && i === messages.length - 1 && currentSources && (
-              <SourcesPanel sources={currentSources} />
-            )}
-          </React.Fragment>
-        ))}
-
-        {streaming && messages[messages.length - 1]?.role !== "bot" && (
-          <TypingIndicator />
+        {showConvEmpty && (
+          <div className="flex flex-col items-center justify-center min-h-[30vh] text-center">
+            <div className="w-12 h-12 rounded-xl bg-primary-600/10 flex items-center justify-center mb-3">
+              <MessageSquareText size={24} className="text-primary-400" />
+            </div>
+            <p className="text-sm text-gray-500 max-w-sm">
+              Cuộc hội thoại này chưa có tin nhắn (hoặc chưa lưu xong). Hãy gửi câu hỏi bên dưới; sau khi stream
+              kết thúc, tin nhắn sẽ được lưu vào PostgreSQL.
+            </p>
+          </div>
         )}
+
+        {!historyLoading &&
+          messages.map((msg, i) => (
+            <React.Fragment key={i}>
+              <ChatMessage
+                role={msg.role}
+                content={msg.content}
+                confidence={msg.confidence}
+                retried={msg.retried}
+              />
+              {msg.role === "bot" && i === messages.length - 1 && currentSources && (
+                <SourcesPanel sources={currentSources} />
+              )}
+            </React.Fragment>
+          ))}
+
+        {streaming && messages[messages.length - 1]?.role !== "bot" && <TypingIndicator />}
 
         <div ref={bottomRef} />
       </div>
 
-      {/* Input area */}
       <div className="px-4 md:px-8 lg:px-16 xl:px-32 pb-4 pt-2">
-        <ChatInput onSend={handleSend} disabled={streaming || !hasDatasets} />
+        <ChatInput onSend={handleSend} disabled={streaming || historyLoading} />
         <p className="text-[10px] text-gray-600 text-center mt-2">
-          RAG Chatbot – Hỏi đáp dựa trên tài liệu • Chạy hoàn toàn local
+          RAG Chatbot – Tra cứu pháp luật • Hội thoại lưu trên PostgreSQL • Streaming từ LLM
         </p>
       </div>
     </div>

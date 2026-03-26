@@ -22,6 +22,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    JSON,
     String,
     Text,
     func,
@@ -49,6 +50,11 @@ class Document(Base):
     issued_date = Column(Date)
     effective_date = Column(Date)
     file_path = Column(Text)
+    law_intents = Column(
+        JSON,
+        nullable=True,
+        comment="Multi-label legal topic tags (same vocabulary as LEGAL_DOMAINS / query domain classifier)",
+    )
     created_at = Column(DateTime, server_default=func.now())
 
     # relationships
@@ -187,3 +193,43 @@ class ChatLog(Base):
     __table_args__ = (
         Index("idx_chatlog_created", "created_at"),
     )
+
+
+# ── Chat conversations (persistent, /api/chat + CRUD) ─────
+
+class ChatConversation(Base):
+    __tablename__ = "chat_conversations"
+
+    id = Column(String(32), primary_key=True, comment="Client-facing conversation id (hex)")
+    title = Column(String(512), nullable=False)
+    context_json = Column(Text, nullable=True, comment="JSON: last_topic, document_history, …")
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    messages = relationship(
+        "ChatMessage",
+        back_populates="conversation",
+        order_by="ChatMessage.id",
+        cascade="all, delete-orphan",
+    )
+
+    __table_args__ = (Index("idx_chat_conv_updated", "updated_at"),)
+
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    conversation_id = Column(
+        String(32),
+        ForeignKey("chat_conversations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    role = Column(String(20), nullable=False)
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
+
+    conversation = relationship("ChatConversation", back_populates="messages")
+
+    __table_args__ = (Index("idx_chat_msg_conv_id", "conversation_id", "id"),)

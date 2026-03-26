@@ -201,8 +201,18 @@ _DOMAIN_KEYWORDS: Dict[str, List[str]] = {
         "xây dựng", "nhà ở",
     ],
     "dan_su": [
-        "hôn nhân", "gia đình", "kết hôn", "ly hôn", "thừa kế",
-        "nuôi con", "hộ tịch",
+        "hôn nhân",
+        "gia đình",
+        "kết hôn",
+        "ly hôn",
+        "thừa kế",
+        "nuôi con",
+        "hộ tịch",
+        "vợ chồng",
+        "đánh chồng",
+        "đánh vợ",
+        "thương tích",
+        "bạo hành",
     ],
     "lao_dong": [
         "lao động", "tiền lương", "hợp đồng lao động", "bảo hiểm xã hội",
@@ -214,9 +224,20 @@ _DOMAIN_KEYWORDS: Dict[str, List[str]] = {
         "dịch bệnh", "phòng chống dịch",
     ],
     "an_sinh": [
-        "bảo trợ xã hội", "an sinh", "người cao tuổi", "người khuyết tật",
-        "trẻ em", "bạo lực gia đình", "trợ cấp", "người yếu thế",
-        "bảo vệ trẻ em", "người già",
+        "bảo trợ xã hội",
+        "an sinh",
+        "người cao tuổi",
+        "người khuyết tật",
+        "trẻ em",
+        "bạo lực gia đình",
+        "bạo lực trong gia đình",
+        "trợ cấp",
+        "người yếu thế",
+        "bảo vệ trẻ em",
+        "người già",
+        "đánh đập",
+        "cố ý gây thương tích",
+        "mâu thuẫn vợ chồng",
     ],
     "moi_truong": [
         "môi trường", "rác thải", "ô nhiễm", "tài nguyên",
@@ -374,6 +395,7 @@ def classify_document_domain(title: str, content_snippet: str = "") -> str:
     """Classify a legal document into a single primary domain.
 
     Used during ingestion to tag the Qdrant payload with `legal_domain`.
+    Prefer :func:`classify_document_law_intents` for multi-label + ``legal_domain = intents[0]``.
     """
     text = f"{title} {content_snippet[:500]}".strip()
     if not text:
@@ -390,16 +412,65 @@ def classify_document_domain(title: str, content_snippet: str = "") -> str:
     return "chung"
 
 
+def classify_document_law_intents(
+    title: str,
+    content_snippet: str = "",
+    max_labels: int = 5,
+) -> List[str]:
+    """Multi-label topic tags for one law (aligned with ``classify_query_domain``).
+
+    Stored on ``documents.law_intents`` and Qdrant ``law_intents`` for retrieval penalties.
+    """
+    text = f"{title} {content_snippet[:2500]}".strip()
+    if not text:
+        return ["chung"]
+
+    ranked = classify_query_domain(text, top_n=max_labels + 4)
+    out: List[str] = []
+    for r in ranked:
+        dom = r["domain"]
+        if dom == "chung":
+            continue
+        if r["confidence"] < 0.38:
+            continue
+        if dom not in out:
+            out.append(dom)
+        if len(out) >= max_labels:
+            break
+
+    if not out:
+        for r in ranked:
+            dom = r["domain"]
+            if dom != "chung" and dom not in out:
+                out.append(dom)
+            if len(out) >= 2:
+                break
+
+    if not out:
+        return ["chung"]
+    return out
+
+
 def get_domain_filter_values(query: str) -> Optional[List[str]]:
     """Return domain values to filter in Qdrant, or None for no filtering.
 
-    Only filters when classification is confident enough (>= 0.60).
-    Returns None (no filter) for ambiguous or general queries.
+    Ưu tiên ngưỡng 0.60; nếu không đủ nhưng có khớp **keyword** rõ (>=0.50) thì vẫn lọc
+    2 domain đầu — giúp câu bạo lực gia đình / thể thao lệch semantic vẫn vào đúng cụm.
     """
     domains = classify_query_domain(query, top_n=3)
 
     confident = [d for d in domains if d["confidence"] >= 0.60 and d["domain"] != "chung"]
-    if not confident:
-        return None
+    if confident:
+        return [d["domain"] for d in confident[:2]]
 
-    return [d["domain"] for d in confident[:2]]
+    keyword_strong = [
+        d
+        for d in domains
+        if d.get("method") == "keyword"
+        and d["confidence"] >= 0.50
+        and d["domain"] != "chung"
+    ]
+    if keyword_strong:
+        return [d["domain"] for d in keyword_strong[:2]]
+
+    return None

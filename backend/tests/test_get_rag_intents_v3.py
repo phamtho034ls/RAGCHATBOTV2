@@ -23,6 +23,8 @@ def test_map_intent_invalid_and_scenario_edge() -> None:
     scen = map_intent_to_rag_flags("xu_ly_vi_pham_hanh_chinh")
     assert scen["is_scenario"] is True
     assert scen["is_legal_lookup"] is False
+    assert scen["use_multi_article"] is True
+    assert scen["needs_expansion"] is True
 
 
 def test_get_rag_intents_empty_query() -> None:
@@ -38,3 +40,4 @@ def test_get_rag_intents_empty_query() -> None:
 def test_get_rag_intents_structural_article_query() -> None:
     flags = get_rag_intents("Điều 6 Luật Đầu tư 2025 quy định gì?")
     assert flags["is_legal_lookup"] is True
+    assert flags["use_multi_article"] is False

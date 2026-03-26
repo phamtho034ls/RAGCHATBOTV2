@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.session import get_db
+from app.database.session import get_db, get_db_context
 from app.models.schemas_v2 import ChatRequest, ChatResponse
 from app.services.rag_chain_v2 import rag_query, rag_query_stream
 
@@ -31,19 +31,25 @@ async def chat(req: ChatRequest, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/chat/stream")
-async def chat_stream(req: ChatRequest, db: AsyncSession = Depends(get_db)):
-    """Streaming chat endpoint – returns answer tokens via SSE."""
+async def chat_stream(req: ChatRequest):
+    """Streaming chat endpoint – returns answer tokens via SSE.
+
+    Session DB phải sống suốt khi stream (không dùng Depends(get_db) trên route):
+    với StreamingResponse, cleanup của dependency có thể chạy ngay khi handler return,
+    khiến session đóng trước khi ``rag_query`` ghi tin nhắn → lịch sử hội thoại trống.
+    """
 
     async def event_generator():
-        async for token in rag_query_stream(
-            query=req.query,
-            db=db,
-            temperature=req.temperature,
-            doc_number=req.doc_number,
-            conversation_id=req.conversation_id,
-        ):
-            yield f"data: {json.dumps({'token': token}, ensure_ascii=False)}\n\n"
-        yield "data: [DONE]\n\n"
+        async with get_db_context() as db:
+            async for token in rag_query_stream(
+                query=req.query,
+                db=db,
+                temperature=req.temperature,
+                doc_number=req.doc_number,
+                conversation_id=req.conversation_id,
+            ):
+                yield f"data: {json.dumps({'token': token}, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
 
     return StreamingResponse(
         event_generator(),

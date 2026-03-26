@@ -10,8 +10,10 @@ Endpoints:
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.database.session import get_db
 from app.models.schemas import (
     ConversationCreate,
     ConversationDetail,
@@ -19,37 +21,40 @@ from app.models.schemas import (
     ConversationListResponse,
     ConversationMessage,
 )
-from app.memory.conversation_store import conversation_store
+from app.services import conversation_repository as conv_repo
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 
 
 @router.get("/{conversation_id}/history")
-async def get_conversation_history(conversation_id: str, limit: int = 20):
+async def get_conversation_history(
+    conversation_id: str,
+    limit: int = 20,
+    db: AsyncSession = Depends(get_db),
+):
     """Lịch sử tin nhắn (10 lượt gần nhất ≈ limit messages)."""
-    conv = conversation_store.get(conversation_id)
-    if not conv:
+    if not await conv_repo.conversation_exists(db, conversation_id):
         raise HTTPException(404, "Conversation không tồn tại")
-    msgs = conversation_store.get_history(conversation_id, limit=limit)
+    msgs = await conv_repo.get_history(db, conversation_id, limit=limit)
     return {"conversation_id": conversation_id, "messages": msgs}
 
 
 @router.get("", response_model=ConversationListResponse)
-async def list_conversations():
+async def list_conversations(db: AsyncSession = Depends(get_db)):
     """Liệt kê tất cả conversations (mới nhất trước)."""
-    convs = conversation_store.list_all()
+    convs = await conv_repo.list_conversations(db)
     return ConversationListResponse(
         conversations=[ConversationInfo(**c) for c in convs]
     )
 
 
 @router.post("", response_model=ConversationInfo)
-async def create_conversation(req: ConversationCreate):
+async def create_conversation(req: ConversationCreate, db: AsyncSession = Depends(get_db)):
     """Tạo conversation mới.
 
     Trả về conversation_id để sử dụng trong /api/chat.
     """
-    conv = conversation_store.create(title=req.title)
+    conv = await conv_repo.create_conversation(db, title=req.title)
     return ConversationInfo(
         id=conv["id"],
         title=conv["title"],
@@ -60,9 +65,9 @@ async def create_conversation(req: ConversationCreate):
 
 
 @router.get("/{conversation_id}", response_model=ConversationDetail)
-async def get_conversation(conversation_id: str):
+async def get_conversation(conversation_id: str, db: AsyncSession = Depends(get_db)):
     """Lấy chi tiết conversation với toàn bộ messages."""
-    conv = conversation_store.get(conversation_id)
+    conv = await conv_repo.get_conversation_detail_dict(db, conversation_id)
     if not conv:
         raise HTTPException(404, "Conversation không tồn tại")
 
@@ -83,8 +88,8 @@ async def get_conversation(conversation_id: str):
 
 
 @router.delete("/{conversation_id}")
-async def delete_conversation(conversation_id: str):
+async def delete_conversation(conversation_id: str, db: AsyncSession = Depends(get_db)):
     """Xóa conversation."""
-    if not conversation_store.delete(conversation_id):
+    if not await conv_repo.delete_conversation(db, conversation_id):
         raise HTTPException(404, "Conversation không tồn tại")
     return {"message": "Đã xóa conversation thành công."}

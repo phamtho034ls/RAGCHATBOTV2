@@ -1,22 +1,51 @@
-import React, { useState } from "react";
+import React, { useState, useCallback } from "react";
 import Sidebar from "./components/Sidebar";
 import ChatPage from "./pages/ChatPage";
 
+const STORAGE_KEY = "rag_chat_conversation_id";
+
+function readStoredConversationId() {
+  try {
+    return localStorage.getItem(STORAGE_KEY) || null;
+  } catch {
+    return null;
+  }
+}
+
 export default function App() {
-  const [selectedDataset, setSelectedDataset] = useState(null);
   const [temperature, setTemperature] = useState(0.5);
-  const [hasDatasets, setHasDatasets] = useState(false);
+  const [conversationId, setConversationIdState] = useState(readStoredConversationId);
+  const [sidebarVersion, setSidebarVersion] = useState(0);
+
+  const setConversationId = useCallback((id) => {
+    setConversationIdState(id);
+    try {
+      if (id) localStorage.setItem(STORAGE_KEY, id);
+      else localStorage.removeItem(STORAGE_KEY);
+    } catch {
+      /* ignore */
+    }
+  }, []);
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-surface">
       <Sidebar
-        selectedDataset={selectedDataset}
-        onSelectDataset={setSelectedDataset}
         temperature={temperature}
         onTemperatureChange={setTemperature}
-        onDatasetsChange={(list) => setHasDatasets(list.length > 0)}
+        activeConversationId={conversationId}
+        onSelectConversation={setConversationId}
+        onConversationCreated={(id) => {
+          setConversationId(id);
+          setSidebarVersion((v) => v + 1);
+        }}
+        sidebarVersion={sidebarVersion}
       />
-      <ChatPage datasetId={selectedDataset} temperature={temperature} hasDatasets={hasDatasets} />
+      <ChatPage
+        conversationId={conversationId}
+        temperature={temperature}
+        onConversationIdChange={setConversationId}
+        onNotifySidebar={() => setSidebarVersion((v) => v + 1)}
+      />
     </div>
   );
 }

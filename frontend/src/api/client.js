@@ -75,6 +75,21 @@ export async function listConversations() {
   return apiFetch("/api/conversations");
 }
 
+export async function createConversation(title) {
+  return apiFetch("/api/conversations", {
+    method: "POST",
+    body: JSON.stringify({ title: title || undefined }),
+  });
+}
+
+export async function getConversationDetail(id) {
+  return apiFetch(`/api/conversations/${id}`);
+}
+
+export async function deleteConversationApi(id) {
+  return apiFetch(`/api/conversations/${id}`, { method: "DELETE" });
+}
+
 export async function chatStream(
   question,
   temperature,
@@ -82,7 +97,8 @@ export async function chatStream(
   onSources,
   onDone,
   conversationId = null,
-  onMeta = null
+  onMeta = null,
+  onTextFinalize = null
 ) {
   const res = await fetch(`${BASE}/api/chat/stream`, {
     method: "POST",
@@ -133,6 +149,10 @@ export async function chatStream(
             }
             if (inner.type === "meta") {
               onMeta?.(inner);
+              continue;
+            }
+            if (inner.type === "text_finalize") {
+              onTextFinalize?.(inner);
               continue;
             }
             if (inner.type === "intent") {

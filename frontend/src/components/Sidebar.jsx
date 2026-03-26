@@ -1,74 +1,87 @@
 import React, { useState, useEffect } from "react";
 import {
-  FileText,
-  Trash2,
   Plus,
   ChevronLeft,
   ChevronRight,
   Settings,
+  MessageSquare,
+  Trash2,
 } from "lucide-react";
-import { getDatasets, deleteDataset, getIntentIndexStats } from "../api/client";
+import {
+  getIntentIndexStats,
+  listConversations,
+  createConversation,
+  deleteConversationApi,
+} from "../api/client";
 import UploadModal from "./UploadModal";
 import TemperatureSlider from "./TemperatureSlider";
 import GpuBadge from "./GpuBadge";
 
 export default function Sidebar({
-  selectedDataset,
-  onSelectDataset,
   temperature,
   onTemperatureChange,
-  onDatasetsChange,
+  activeConversationId,
+  onSelectConversation,
+  onConversationCreated,
+  sidebarVersion,
 }) {
-  const [datasets, setDatasets] = useState([]);
+  const [conversations, setConversations] = useState([]);
   const [showUpload, setShowUpload] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
   const [intentStats, setIntentStats] = useState(null);
 
-  const refreshDatasets = async () => {
+  const refreshConversations = async () => {
     try {
-      const res = await getDatasets();
-      const list = res.datasets || [];
-      setDatasets(list);
-      onDatasetsChange?.(list);
-      return list;
+      const res = await listConversations();
+      setConversations(res.conversations || []);
     } catch {
-      /* ignore */
-      return [];
+      setConversations([]);
     }
   };
 
   useEffect(() => {
-    refreshDatasets().then((list) => {
-      if (!selectedDataset && list.length > 0) {
-        onSelectDataset(list[0].dataset_id);
-      }
-    });
     getIntentIndexStats()
       .then(setIntentStats)
       .catch(() => setIntentStats(null));
   }, []);
 
-  const handleDelete = async (id) => {
-    if (!confirm("Bạn có chắc muốn xóa tài liệu này?")) return;
+  useEffect(() => {
+    refreshConversations();
+  }, [sidebarVersion]);
+
+  const handleUploadDone = () => {
+    setShowUpload(false);
+  };
+
+  const handleNewConversation = async () => {
     try {
-      await deleteDataset(id);
-      if (selectedDataset === id) onSelectDataset(null);
-      refreshDatasets();
+      const c = await createConversation();
+      await refreshConversations();
+      const id = c.id != null ? String(c.id) : "";
+      onConversationCreated?.(id);
+      onSelectConversation?.(id);
     } catch {
       /* ignore */
     }
   };
 
-  const handleUploadDone = (data) => {
-    setShowUpload(false);
-    refreshDatasets();
-    onSelectDataset(data.dataset_id);
+  const handleDeleteConversation = async (e, id) => {
+    e.stopPropagation();
+    if (!confirm("Xóa cuộc hội thoại này?")) return;
+    try {
+      await deleteConversationApi(id);
+      await refreshConversations();
+      if (activeConversationId === id) onSelectConversation?.(null);
+    } catch {
+      /* ignore */
+    }
   };
 
   if (collapsed) {
     return (
       <div className="flex flex-col items-center py-4 gap-3 bg-surface-card border-r border-surface-border w-12">
         <button
+          type="button"
           onClick={() => setCollapsed(false)}
           className="p-2 rounded-lg hover:bg-surface-hover text-gray-400"
         >
@@ -81,12 +94,12 @@ export default function Sidebar({
   return (
     <>
       <aside className="w-72 bg-surface-card border-r border-surface-border flex flex-col h-full">
-        {/* Header */}
         <div className="flex items-center justify-between px-4 py-4 border-b border-surface-border">
           <h1 className="text-base font-semibold text-gray-100 flex items-center gap-2">
             <span className="text-xl">🤖</span> RAG Chat
           </h1>
           <button
+            type="button"
             onClick={() => setCollapsed(true)}
             className="p-1.5 rounded-lg hover:bg-surface-hover text-gray-400"
           >
@@ -94,53 +107,67 @@ export default function Sidebar({
           </button>
         </div>
 
-        {/* Upload button */}
-        <div className="px-3 pt-3">
+        <div className="px-3 pt-3 space-y-2">
           <button
+            type="button"
             onClick={() => setShowUpload(true)}
             className="w-full flex items-center gap-2 px-3 py-2.5 rounded-xl border border-dashed border-surface-border hover:border-primary-400 hover:bg-surface-hover text-sm text-gray-300 transition-colors"
           >
             <Plus size={16} />
             Tải lên tài liệu (.doc, .docx)
           </button>
+          <button
+            type="button"
+            onClick={handleNewConversation}
+            className="w-full flex items-center gap-2 px-3 py-2.5 rounded-xl border border-surface-border hover:bg-surface-hover text-sm text-gray-300 transition-colors"
+          >
+            <MessageSquare size={16} />
+            Cuộc hội thoại mới
+          </button>
         </div>
 
-        {/* Dataset list */}
-        <div className="flex-1 overflow-y-auto px-3 py-2 space-y-1">
-          <p className="text-xs text-gray-500 uppercase tracking-wider px-1 py-2">
-            Tài liệu
-          </p>
-          {datasets.length === 0 && (
-            <p className="text-xs text-gray-600 px-1">
-              Chưa có tài liệu nào. Hãy tải lên file .doc / .docx để bắt đầu.
+        <div className="flex-1 overflow-y-auto px-3 py-2 space-y-3">
+          <div>
+            <p className="text-xs text-gray-500 uppercase tracking-wider px-1 py-2">
+              Hội thoại
             </p>
-          )}
-          {datasets.map((ds) => (
-            <div
-              key={ds.dataset_id}
-              onClick={() => onSelectDataset(ds.dataset_id)}
-              className={`group flex items-center gap-2 px-3 py-2 rounded-xl cursor-pointer text-sm transition-colors ${
-                selectedDataset === ds.dataset_id
-                  ? "bg-primary-600/15 text-primary-400 border border-primary-600/30"
-                  : "text-gray-400 hover:bg-surface-hover hover:text-gray-200 border border-transparent"
-              }`}
-            >
-              <FileText size={15} className="flex-shrink-0" />
-              <span className="flex-1 truncate">{ds.file_name}</span>
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  handleDelete(ds.dataset_id);
-                }}
-                className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-red-500/20 text-gray-500 hover:text-red-400 transition"
-              >
-                <Trash2 size={13} />
-              </button>
+            {conversations.length === 0 && (
+              <p className="text-xs text-gray-600 px-1">Chưa có hội thoại lưu.</p>
+            )}
+            <div className="space-y-1">
+              {conversations.map((c, idx) => {
+                const cid = c.id != null ? String(c.id) : `row-${idx}`;
+                return (
+                  <div
+                    key={cid}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => onSelectConversation?.(cid)}
+                    onKeyDown={(ev) => {
+                      if (ev.key === "Enter" || ev.key === " ") onSelectConversation?.(cid);
+                    }}
+                    className={`group flex items-center gap-2 px-3 py-2 rounded-xl cursor-pointer text-sm transition-colors ${
+                      activeConversationId != null && String(activeConversationId) === cid
+                        ? "bg-primary-600/15 text-primary-400 border border-primary-600/30"
+                        : "text-gray-400 hover:bg-surface-hover hover:text-gray-200 border border-transparent"
+                    }`}
+                  >
+                    <MessageSquare size={15} className="flex-shrink-0 opacity-70" />
+                    <span className="flex-1 truncate">{c.title || cid}</span>
+                    <button
+                      type="button"
+                      onClick={(e) => handleDeleteConversation(e, cid)}
+                      className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-red-500/20 text-gray-500 hover:text-red-400 transition"
+                    >
+                      <Trash2 size={13} />
+                    </button>
+                  </div>
+                );
+              })}
             </div>
-          ))}
+          </div>
         </div>
 
-        {/* Settings */}
         <div className="border-t border-surface-border px-4 py-3 space-y-3">
           <div className="flex items-center gap-2 text-xs text-gray-500 uppercase tracking-wider">
             <Settings size={13} />

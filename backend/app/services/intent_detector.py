@@ -1,20 +1,16 @@
 """
-Intent Detection Module v5 — 3-Tier Semantic + LLM + Auto-index
+Intent detection — guard → PhoBERT → prototype embedding → structural (YAML) → LLM.
 
-Pipeline (executed in order, stops at first high-confidence match):
+Pipeline (dừng khi một tầng trả intent đủ tin cậy):
 
-  Layer 0: Guard       → empty / too-short / noise queries              (~0 ms)
-  Layer 1: Structural  → "Điều X", số hiệu VB, "Tóm tắt NĐ"          (~0 ms)
-  Layer 2: Semantic    → cosine similarity vs prototype embeddings      (~2 ms)
-  Layer 3: LLM         → zero-shot GPT classification (complex queries) (~1-3 s)
+  Layer 0: Guard — câu rỗng / quá ngắn / không có chữ cái
+  Layer 1: Classifier — PhoBERT trong ``app/intent_model`` (``INTENT_MODEL_ENABLED``)
+  Layer 2: Semantic — cosine với prototype (SentenceTransformer); câu mẫu + ``intent_patterns/routing.yaml``
+  Layer 3: Structural — regex fallback từ YAML (``INTENT_PATTERNS_YAML``), không ưu tiên trước ML
+  Layer 4: LLM — zero-shot khi các tầng trên không quyết định
 
-Tier 1 – Semantic Similarity:  ~5 prototype sentences per intent,
-         pre-embedded at startup, cosine-matched against query embedding.
-Tier 2 – Zero-shot LLM:       Full catalog + disambiguation rules + CoT.
-Tier 3 – Auto-index from DB:  On document upload, extract representative
-         sentences and merge into the prototype index automatically.
-
-All public interfaces are backward-compatible.
+Structural/routing patterns: ``app/intent_patterns/routing.yaml`` (mở rộng không cần sửa Python).
+API công khai giữ tương thích: ``detect_intent``, ``detect_intent_rule_based``, ``map_intent_to_rag_flags``.
 """
 from __future__ import annotations
 
@@ -27,75 +23,101 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
+from app.services.intent_pattern_config import (
+    get_prototype_sentences_extra,
+    structural_match,
+)
+
 # ══════════════════════════════════════════════════════════════
 # CONSTANTS — KHÔNG THAY ĐỔI (các module khác import trực tiếp)
 # ══════════════════════════════════════════════════════════════
 
+# 18 nhãn (thứ tự khớp lớp 0..17 của model PhoBERT fine-tune). Không thêm/bớt khi chưa train lại.
 VALID_INTENTS: List[str] = [
-    "tra_cuu_van_ban",
+    "admin_planning",
     "article_query",
-    "document_metadata",
-    "program_goal",
-    "document_relation",
     "can_cu_phap_ly",
-    "soan_thao_van_ban",
+    "document_meta_relation",
     "giai_thich_quy_dinh",
+    "hoa_giai_van_dong",
+    "hoi_dap_chung",
     "huong_dan_thu_tuc",
     "kiem_tra_ho_so",
-    "tom_tat_van_ban",
-    "so_sanh_van_ban",
-    "tao_bao_cao",
-    "trich_xuat_van_ban",
-    "admin_planning",
-    "xu_ly_vi_pham_hanh_chinh",
     "kiem_tra_thanh_tra",
-    "thu_tuc_hanh_chinh",
-    "hoa_giai_van_dong",
-    "bao_ve_xa_hoi",
+    "so_sanh_van_ban",
+    "soan_thao_van_ban",
+    "tao_bao_cao",
+    "tom_tat_van_ban",
     "to_chuc_su_kien_cong",
-    "bao_ton_phat_trien",
-    "hoi_dap_chung",
+    "tra_cuu_van_ban",
+    "trich_xuat_van_ban",
+    "xu_ly_vi_pham_hanh_chinh",
 ]
 
-COMMUNE_LEVEL_INTENTS: set = {
-    "xu_ly_vi_pham_hanh_chinh",
-    "kiem_tra_thanh_tra",
-    "thu_tuc_hanh_chinh",
-    "hoa_giai_van_dong",
-    "bao_ve_xa_hoi",
-    "to_chuc_su_kien_cong",
-    "bao_ton_phat_trien",
+# Alias nhãn cũ (23 intent) → nhãn mới — dùng sau LLM / dữ liệu huấn luyện cũ
+LEGACY_INTENT_ALIASES: Dict[str, str] = {
+    "document_metadata": "document_meta_relation",
+    "document_relation": "document_meta_relation",
+    "thu_tuc_hanh_chinh": "huong_dan_thu_tuc",
+    "bao_ve_xa_hoi": "giai_thich_quy_dinh",
+    "bao_ton_phat_trien": "giai_thich_quy_dinh",
+    "program_goal": "giai_thich_quy_dinh",
 }
 
-# ══════════════════════════════════════════════════════════════
-# LAYER 1: STRUCTURAL DETECTION — deterministic, ~0 ms
-# ══════════════════════════════════════════════════════════════
+COMMUNE_LEVEL_INTENTS: frozenset = frozenset({
+    "xu_ly_vi_pham_hanh_chinh",
+    "kiem_tra_thanh_tra",
+    "hoa_giai_van_dong",
+    "to_chuc_su_kien_cong",
+    "huong_dan_thu_tuc",
+    "giai_thich_quy_dinh",
+})
 
-_STRUCTURAL_RULES: List[Tuple[str, str, float]] = [
-    (r"điều\s+\d+\s+(luật|nghị\s*định|thông\s*tư|quyết\s*định|pháp\s*lệnh|chỉ\s*thị)", "article_query", 0.97),
-    (r"khoản\s+\d+\s+điều\s+\d+", "article_query", 0.97),
-    (r"^\s*điều\s+\d+[\s,\.]*$", "article_query", 0.95),
-    (r"\b\d{1,3}/\d{4}/[A-ZĐa-zđ\-]+\b", "article_query", 0.95),
-    (r"\b\d{1,3}/[A-ZĐa-zđ]{2,}-[A-ZĐa-zđ]{2,}\b", "article_query", 0.93),
-    (r"(tóm\s*tắt|tổng\s*hợp|khái\s*quát)\s+(nghị\s*định|luật|thông\s*tư|quyết\s*định|chỉ\s*thị)", "tom_tat_van_ban", 0.95),
-    (r"so\s*sánh\s+.{0,30}(luật|nghị\s*định|thông\s*tư).{0,30}(và|với|so\s*với)", "so_sanh_van_ban", 0.95),
-    (r"(soạn|viết)\s+(công\s*văn|tờ\s*trình|biên\s*bản|quyết\s*định|thông\s*báo|đơn\s+xin)", "soan_thao_van_ban", 0.95),
-    (r"(lập|tạo)\s+(công\s*văn|tờ\s*trình|quyết\s*định|thông\s*báo|đơn\s+xin)", "soan_thao_van_ban", 0.95),
-    (r"(tạo|viết|lập|soạn)\s+(báo\s*cáo)", "tao_bao_cao", 0.95),
-    (r"(đã\s+nộp|đã\s+có|đã\s+gửi).{0,50}(còn\s+thiếu|thiếu\s+gì|đủ\s+chưa)", "kiem_tra_ho_so", 0.95),
-    (r"(ban\s*hành|có\s*hiệu\s*lực|hết\s*hiệu\s*lực)\s+(ngày|năm|khi|từ)\s+nào", "document_metadata", 0.95),
-    (r"(ai|cơ\s*quan\s*nào)\s+(ban\s*hành|ký\s*ban\s*hành|phê\s*duyệt)", "document_metadata", 0.93),
-]
+
+def normalize_legacy_intent(intent: Optional[str]) -> str:
+    """Chuẩn hoá intent từ LLM / log cũ; giữ nguyên ``nan``."""
+    if not intent:
+        return "hoi_dap_chung"
+    if intent == "nan":
+        return "nan"
+    return LEGACY_INTENT_ALIASES.get(intent, intent)
+
+
+def _finalize_detector_tuple(det: str, conf: float) -> Tuple[str, float]:
+    """Chuẩn hoá nhãn classifier/semantic/structural; ``nan`` giữ nguyên."""
+    if det == "nan":
+        return "nan", conf
+    nd = normalize_legacy_intent(det)
+    if nd == "nan":
+        return "nan", conf
+    if nd not in VALID_INTENTS:
+        return "hoi_dap_chung", min(float(conf), 0.35)
+    return nd, float(conf)
+
+
+# ══════════════════════════════════════════════════════════════
+# LAYER 3: STRUCTURAL — app/intent_patterns/routing.yaml
+# ══════════════════════════════════════════════════════════════
 
 
 def _detect_structural(query: str) -> Optional[Tuple[str, float]]:
-    """Layer 1: Structural pattern detection (~0 ms)."""
-    q = query.lower().strip()
-    for pattern, intent, confidence in _STRUCTURAL_RULES:
-        if re.search(pattern, q):
-            log.debug("Structural match [%s]: pattern='%s'", intent, pattern[:40])
-            return intent, confidence
+    """Regex structural từ ``intent_patterns/routing.yaml`` (fallback)."""
+    hit = structural_match(query.lower().strip())
+    if hit:
+        intent, confidence = hit
+        intent, confidence = _finalize_detector_tuple(intent, confidence)
+        log.debug("Structural (YAML) [%s] conf=%.2f", intent, confidence)
+        return intent, confidence
     return None
+
+
+def _merged_intent_prototypes() -> Dict[str, List[str]]:
+    extra = get_prototype_sentences_extra()
+    out = {k: list(v) for k, v in INTENT_PROTOTYPES.items()}
+    for k, sentences in extra.items():
+        out.setdefault(k, [])
+        out[k].extend(sentences)
+    return out
 
 
 # ══════════════════════════════════════════════════════════════
@@ -116,28 +138,17 @@ INTENT_PROTOTYPES: Dict[str, List[str]] = {
         "Nội dung khoản 2 Điều 6 Luật Đầu tư 2025",
         "Điều 9 Nghị định 144 nói về vấn đề gì?",
         "Quy định cụ thể tại Điều 15 Luật Quảng cáo",
-        "Chính sách bảo trợ xã hội nằm trong điều luật nào?",
+        "Mục 3 Chương II Luật Thư viện quy định thế nào?",
     ],
-    "document_metadata": [
+    "document_meta_relation": [
         "Nghị định 36/2019 do cơ quan nào ban hành?",
         "Luật Di sản văn hóa có hiệu lực từ ngày nào?",
         "Ai ký ban hành Thông tư 13/2024?",
-        "Nghị định 144 ban hành năm nào?",
-        "Quyết định 706 có còn hiệu lực không?",
-    ],
-    "program_goal": [
-        "Mục tiêu chương trình mục tiêu quốc gia nông thôn mới",
-        "Đề án phát triển văn hóa 2030 nhằm mục đích gì?",
-        "Chỉ tiêu chính của kế hoạch phát triển kinh tế xã hội",
-        "Nhiệm vụ chủ yếu của chương trình giảm nghèo bền vững",
-        "Mục đích của đề án bảo tồn di sản văn hóa phi vật thể",
-    ],
-    "document_relation": [
         "Luật nào sửa đổi Luật Di sản văn hóa 2001?",
         "Nghị định 36/2019 thay thế nghị định nào?",
         "Văn bản nào bãi bỏ Thông tư 04/2010?",
+        "Quyết định 706 có còn hiệu lực không?",
         "Luật Đầu tư 2025 sửa đổi bổ sung những luật nào?",
-        "Nghị định mới thay thế Nghị định 110/2018?",
     ],
     "can_cu_phap_ly": [
         "Căn cứ pháp lý của kế hoạch quản lý di tích",
@@ -159,6 +170,12 @@ INTENT_PROTOTYPES: Dict[str, List[str]] = {
         "Quyền của người khuyết tật theo quy định pháp luật",
         "Thế nào là di sản văn hóa phi vật thể?",
         "Giải thích quy định về quản lý hoạt động karaoke",
+        "Mục tiêu chương trình mục tiêu quốc gia nông thôn mới?",
+        "Đề án phát triển văn hóa 2030 nhằm mục đích gì?",
+        "Trẻ em bị bố đánh đập hàng ngày, cần can thiệp ngay",
+        "Người già bị con cái bỏ rơi không chăm sóc",
+        "Ngôi chùa cổ bị hư hỏng sau bão, cần trùng tu",
+        "Bảo tồn làng nghề truyền thống đan lát",
     ],
     "huong_dan_thu_tuc": [
         "Thủ tục đăng ký kinh doanh gồm mấy bước?",
@@ -166,6 +183,11 @@ INTENT_PROTOTYPES: Dict[str, List[str]] = {
         "Quy trình đăng ký hộ khẩu thường trú",
         "Các bước xin cấp giấy chứng nhận quyền sử dụng đất",
         "Làm sao để đăng ký kết hôn?",
+        "Thủ tục xin phép tổ chức lễ hội dân gian cấp xã",
+        "Hồ sơ đăng ký sinh hoạt tôn giáo tập trung",
+        "Thủ tục xin cấp phép tu bổ ngôi đình cổ",
+        "Đăng ký hoạt động biểu diễn nghệ thuật tại xã",
+        "Mẫu đơn xin phép có tải ở đâu?",
     ],
     "kiem_tra_ho_so": [
         "Tôi đã nộp giấy đề nghị và điều lệ công ty, còn thiếu gì?",
@@ -223,26 +245,12 @@ INTENT_PROTOTYPES: Dict[str, List[str]] = {
         "Rà soát giấy phép kinh doanh các cơ sở dịch vụ",
         "Thanh tra việc chấp hành quy định về quảng cáo",
     ],
-    "thu_tuc_hanh_chinh": [
-        "Thủ tục xin phép tổ chức lễ hội dân gian cấp xã",
-        "Hồ sơ đăng ký sinh hoạt tôn giáo tập trung",
-        "Thủ tục xin cấp phép tu bổ ngôi đình cổ",
-        "Đăng ký hoạt động biểu diễn nghệ thuật tại xã",
-        "Hồ sơ công nhận gia đình văn hóa, thôn văn hóa",
-    ],
     "hoa_giai_van_dong": [
         "Hai hàng xóm tranh chấp ranh giới đất, cần hòa giải",
         "Vận động người dân thực hiện nếp sống văn minh trong lễ hội",
         "Hòa giải mâu thuẫn tiếng ồn giữa hai gia đình",
         "Tuyên truyền phổ biến pháp luật cho nhân dân",
         "Vận động cộng đồng chấp hành hương ước thôn bản",
-    ],
-    "bao_ve_xa_hoi": [
-        "Trẻ em bị bố đánh đập hàng ngày, cần can thiệp ngay",
-        "Người già bị con cái bỏ rơi không chăm sóc",
-        "Phụ nữ bị chồng bạo lực gia đình, cần hỗ trợ khẩn cấp",
-        "Phát hiện trẻ em lang thang không nơi nương tựa",
-        "Người khuyết tật bị ngược đãi, cần bảo vệ",
     ],
     "to_chuc_su_kien_cong": [
         "Tổ chức Đại hội Thể dục thể thao cấp xã",
@@ -251,19 +259,23 @@ INTENT_PROTOTYPES: Dict[str, List[str]] = {
         "Chuẩn bị lễ hội truyền thống hàng năm của xã",
         "Kế hoạch tổ chức giải bóng chuyền cấp thôn",
     ],
-    "bao_ton_phat_trien": [
-        "Ngôi chùa cổ bị hư hỏng sau bão, cần trùng tu",
-        "Bảo tồn làng nghề truyền thống đan lát",
-        "Di tích lịch sử cấp quốc gia xuống cấp nghiêm trọng",
-        "Phát huy giá trị di sản văn hóa phi vật thể địa phương",
-        "Khôi phục nghề thủ công truyền thống đang mai một",
-    ],
     "hoi_dap_chung": [
+        "Công thức nấu phở bò truyền thống như thế nào?",
+        "Tỷ giá USD hôm nay là bao nhiêu?",
+        "Viết chương trình Python đọc file Excel",
+        "Kết quả bóng đá Ngoại hạng Anh đêm qua",
+        "Thời tiết Hà Nội ngày mai có mưa không?",
+        "Bitcoin có nên đầu tư lúc này?",
+        "Cách học IELTS nhanh trong 2 tuần",
         "Xin chào",
         "Bạn là ai?",
         "Hệ thống này làm được gì?",
         "Cảm ơn bạn",
         "Tạm biệt",
+        "Gợi ý khách sạn giá rẻ ở Đà Lạt",
+        "Cách làm bánh flan không bị rỗ",
+        "Chiến thuật mở đầu ván cờ vua",
+        "So sánh iPhone với Samsung (điện thoại)",
     ],
 }
 
@@ -281,7 +293,8 @@ def _build_prototype_index() -> None:
 
     sentences: List[str] = []
     labels: List[str] = []
-    for intent, protos in INTENT_PROTOTYPES.items():
+    merged = _merged_intent_prototypes()
+    for intent, protos in merged.items():
         for s in protos:
             sentences.append(s)
             labels.append(intent)
@@ -295,8 +308,8 @@ def _build_prototype_index() -> None:
     _proto_intents = labels
     elapsed = (time.monotonic() - t0) * 1000
     log.info(
-        "Intent prototype index built: %d sentences, %d intents (%.0f ms)",
-        len(sentences), len(INTENT_PROTOTYPES), elapsed,
+        "Intent prototype index built: %d sentences, %d intent keys (%.0f ms)",
+        len(sentences), len(merged), elapsed,
     )
 
 
@@ -354,6 +367,7 @@ def _detect_semantic(query: str) -> Optional[Tuple[str, float]]:
     else:
         return None  # defer to LLM
 
+    best_intent, confidence = _finalize_detector_tuple(best_intent, confidence)
     log.info(
         "Semantic match: %s (sim=%.3f, gap=%.3f, conf=%.2f)",
         best_intent, best_sim, gap, confidence,
@@ -366,146 +380,121 @@ def _detect_semantic(query: str) -> Optional[Tuple[str, float]]:
 # ══════════════════════════════════════════════════════════════
 
 INTENT_SEMANTIC_DESCRIPTIONS: Dict[str, str] = {
-    "tra_cuu_van_ban": "Tìm kiếm, tra cứu văn bản pháp luật theo chủ đề hoặc lĩnh vực (chưa biết tên/số hiệu cụ thể)",
-    "article_query": "Hỏi về nội dung Điều/Khoản cụ thể, hoặc tra cứu theo số hiệu văn bản đã biết",
-    "document_metadata": "Hỏi thông tin hành chính của văn bản: ai ban hành, ngày ban hành, còn hiệu lực không",
-    "program_goal": "Hỏi về mục tiêu, mục đích, chỉ tiêu của chương trình/đề án/kế hoạch quốc gia",
-    "document_relation": "Hỏi quan hệ giữa các văn bản: văn bản nào sửa đổi/thay thế/bãi bỏ văn bản nào",
-    "can_cu_phap_ly": "Hỏi căn cứ pháp lý: văn bản nào làm cơ sở pháp lý, dựa vào luật nào",
-    "soan_thao_van_ban": "Yêu cầu soạn/viết văn bản hành chính: công văn, tờ trình, biên bản, quyết định",
-    "giai_thich_quy_dinh": "Giải thích quy định pháp luật, chính sách, chế độ; hỏi 'là gì', 'hiểu thế nào'",
-    "huong_dan_thu_tuc": "Hỏi quy trình/thủ tục/các bước thực hiện; hỏi hồ sơ cần gì, nộp ở đâu",
-    "kiem_tra_ho_so": "Kiểm tra hồ sơ đã nộp còn thiếu gì so với yêu cầu",
-    "tom_tat_van_ban": "Tóm tắt, khái quát nội dung văn bản pháp luật cụ thể đã biết tên",
-    "so_sanh_van_ban": "So sánh nội dung hai văn bản luật, tìm điểm giống/khác",
-    "tao_bao_cao": "Tạo/lập báo cáo hành chính, tổng kết, đánh giá",
-    "trich_xuat_van_ban": "Liệt kê/trích xuất toàn bộ danh mục từ văn bản: điều cấm, quyền, nghĩa vụ",
     "admin_planning": "Lập kế hoạch quản lý, phân bổ nguồn lực, tổ chức thực hiện cấp địa phương",
-    "xu_ly_vi_pham_hanh_chinh": "Xử lý vi phạm hành chính: karaoke ồn, quảng cáo trái phép, kinh doanh không phép",
-    "kiem_tra_thanh_tra": "Tổ chức đoàn kiểm tra, thanh tra cơ sở kinh doanh/dịch vụ văn hóa",
-    "thu_tuc_hanh_chinh": "Thủ tục hành chính cấp xã: đăng ký lễ hội, cấp phép biểu diễn, tu bổ di tích",
-    "hoa_giai_van_dong": "Hòa giải tranh chấp dân sự, vận động nhân dân nếp sống văn minh",
-    "bao_ve_xa_hoi": "Bảo vệ nạn nhân bạo lực gia đình, trẻ em bị xâm hại, người yếu thế — khẩn cấp",
-    "to_chuc_su_kien_cong": "Tổ chức sự kiện văn hóa thể thao: lễ hội, đại hội TDTT, biểu diễn văn nghệ",
-    "bao_ton_phat_trien": "Bảo tồn di sản văn hóa, trùng tu di tích, phát huy giá trị truyền thống",
-    "hoi_dap_chung": "Câu hỏi chung, chào hỏi, không thuộc các loại trên",
+    "article_query": "Hỏi nội dung Điều/Khoản/Mục cụ thể hoặc tra cứu theo số hiệu văn bản đã biết",
+    "can_cu_phap_ly": "Hỏi căn cứ pháp lý: văn bản nào làm cơ sở, mâu thuẫn luật áp dụng thế nào",
+    "document_meta_relation": "Hỏi metadata văn bản (ban hành, hiệu lực) hoặc quan hệ sửa đổi/thay thế/bãi bỏ giữa các văn bản",
+    "giai_thich_quy_dinh": "Giải thích quy định, chính sách, mục tiêu chương trình; bảo vệ xã hội/di sản theo góc độ quy định (gộp program_goal, bảo vệ XH, bảo tồn)",
+    "hoa_giai_van_dong": "Hòa giải tranh chấp, vận động nhân dân, tuyên truyền vận động",
+    "hoi_dap_chung": "Chào hỏi hoặc câu không thuộc phạm vi pháp luật–hành chính cụ thể",
+    "huong_dan_thu_tuc": "Hướng dẫn thủ tục, hồ sơ, mẫu đơn, thời hạn, nộp tại UBND/một cửa (gộp thủ tục hành chính cấp xã)",
+    "kiem_tra_ho_so": "Đã nộp hồ sơ — kiểm tra còn thiếu gì, đủ chưa",
+    "kiem_tra_thanh_tra": "Kế hoạch/đoàn thanh tra, kiểm tra định kỳ cơ sở",
+    "so_sanh_van_ban": "So sánh, đối chiếu nội dung hai hoặc nhiều văn bản",
+    "soan_thao_van_ban": "Soạn công văn, tờ trình, biên bản, quyết định, thông báo",
+    "tao_bao_cao": "Lập/viết báo cáo hành chính, tổng kết",
+    "tom_tat_van_ban": "Tóm tắt, khái quát nội dung một văn bản đã biết tên/số",
+    "to_chuc_su_kien_cong": "Tổ chức sự kiện, lễ hội, đại hội TDTT, biểu diễn",
+    "tra_cuu_van_ban": "Tìm văn bản theo chủ đề (chưa rõ điều khoản cụ thể)",
+    "trich_xuat_van_ban": "Liệt kê/trích toàn bộ mục từ văn bản (danh mục cấm, quyền, nghĩa vụ)",
+    "xu_ly_vi_pham_hanh_chinh": "Xử lý/xử phạt vi phạm hành chính đang xảy ra",
 }
 
 _INTENT_CATALOG: Dict[str, Dict] = {
-    "tra_cuu_van_ban": {
-        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["tra_cuu_van_ban"],
-        "vi_du": ["Văn bản nào quy định về lễ hội dân gian?", "Tìm các nghị định về quảng cáo"],
-        "khong_phai": "Nếu đã biết tên luật cụ thể/số điều → article_query hoặc tom_tat_van_ban",
+    "admin_planning": {
+        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["admin_planning"],
+        "vi_du": ["Kế hoạch quản lý di tích 2025", "Phân bổ nhân sự bộ phận VH"],
+        "khong_phai": "Sự kiện → to_chuc_su_kien_cong",
     },
     "article_query": {
         "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["article_query"],
         "vi_du": ["Điều 47 Luật Di sản văn hóa quy định gì?", "Khoản 2 Điều 6 Luật Đầu tư 2025"],
-        "khong_phai": "Nếu không có số Điều/Khoản cụ thể → tra_cuu_van_ban hoặc trich_xuat_van_ban",
-    },
-    "document_metadata": {
-        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["document_metadata"],
-        "vi_du": ["Thông tư 13/2024 do cơ quan nào ban hành?", "Nghị định 36/2019 có còn hiệu lực không?"],
-        "khong_phai": "Nếu hỏi nội dung trong văn bản → article_query",
-    },
-    "program_goal": {
-        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["program_goal"],
-        "vi_du": ["Mục tiêu chương trình nông thôn mới?", "Đề án phát triển văn hóa 2030 nhằm gì?"],
-        "khong_phai": "",
-    },
-    "document_relation": {
-        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["document_relation"],
-        "vi_du": ["Luật nào sửa đổi Luật Di sản văn hóa 2001?", "Nghị định 36/2019 thay thế NĐ nào?"],
-        "khong_phai": "So sánh nội dung → so_sanh_van_ban",
+        "khong_phai": "Không có Điều/Khoản cụ thể → tra_cuu_van_ban / trich_xuat_van_ban",
     },
     "can_cu_phap_ly": {
         "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["can_cu_phap_ly"],
-        "vi_du": ["Căn cứ pháp lý của kế hoạch này?", "Mâu thuẫn luật thì áp dụng luật nào?"],
+        "vi_du": ["Căn cứ pháp lý của kế hoạch?", "Hai luật mâu thuẫn áp dụng luật nào?"],
         "khong_phai": "",
     },
-    "soan_thao_van_ban": {
-        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["soan_thao_van_ban"],
-        "vi_du": ["Soạn công văn xin gia hạn giấy phép", "Viết tờ trình đề nghị cấp kinh phí"],
-        "khong_phai": "Thủ tục → huong_dan_thu_tuc; báo cáo → tao_bao_cao",
+    "document_meta_relation": {
+        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["document_meta_relation"],
+        "vi_du": ["Nghị định 36/2019 do ai ban hành?", "Luật nào sửa Luật DSVH 2001?", "TT 04 còn hiệu lực không?"],
+        "khong_phai": "So sánh nội dung chi tiết → so_sanh_van_ban",
     },
     "giai_thich_quy_dinh": {
         "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["giai_thich_quy_dinh"],
-        "vi_du": ["Chính sách bảo trợ xã hội là gì?", "An sinh xã hội bao gồm gì?"],
-        "khong_phai": "Bạo hành khẩn cấp → bao_ve_xa_hoi",
-    },
-    "huong_dan_thu_tuc": {
-        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["huong_dan_thu_tuc"],
-        "vi_du": ["Thủ tục đăng ký kinh doanh?", "Hồ sơ xin cấp phép xây dựng?"],
-        "khong_phai": "Thủ tục cấp xã → thu_tuc_hanh_chinh",
-    },
-    "kiem_tra_ho_so": {
-        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["kiem_tra_ho_so"],
-        "vi_du": ["Đã nộp giấy đề nghị, còn thiếu gì?", "Hồ sơ đã đủ chưa?"],
-        "khong_phai": "Chưa có gì, hỏi cần gì → huong_dan_thu_tuc",
-    },
-    "tom_tat_van_ban": {
-        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["tom_tat_van_ban"],
-        "vi_du": ["Tóm tắt Luật Đầu tư 2025", "Nội dung chính NĐ 144"],
-        "khong_phai": "Mục tiêu chương trình → program_goal",
-    },
-    "so_sanh_van_ban": {
-        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["so_sanh_van_ban"],
-        "vi_du": ["Luật ĐT 2020 và 2025 khác gì?", "Điểm mới Luật DSVH sửa đổi?"],
-        "khong_phai": "VB nào thay thế VB nào → document_relation",
-    },
-    "tao_bao_cao": {
-        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["tao_bao_cao"],
-        "vi_du": ["Lập báo cáo tổng kết VH 2025", "Viết báo cáo phong trào toàn dân"],
-        "khong_phai": "Công văn/tờ trình → soan_thao_van_ban",
-    },
-    "trich_xuat_van_ban": {
-        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["trich_xuat_van_ban"],
-        "vi_du": ["Các ngành nghề cấm đầu tư", "Liệt kê quyền nhà đầu tư"],
-        "khong_phai": "Một điều cụ thể → article_query",
-    },
-    "admin_planning": {
-        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["admin_planning"],
-        "vi_du": ["Kế hoạch quản lý di tích 2025", "Phân bổ nhân sự bộ phận VH"],
-        "khong_phai": "Sự kiện → to_chuc_su_kien_cong; vi phạm → xu_ly_vi_pham",
-    },
-    "xu_ly_vi_pham_hanh_chinh": {
-        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["xu_ly_vi_pham_hanh_chinh"],
-        "vi_du": ["Karaoke ồn quá giờ, xử phạt?", "Biển QC vi phạm, xử lý?"],
-        "khong_phai": "Thủ tục cấp phép → thu_tuc_hanh_chinh",
-    },
-    "kiem_tra_thanh_tra": {
-        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["kiem_tra_thanh_tra"],
-        "vi_du": ["Kiểm tra đột xuất quán karaoke", "KH thanh tra cơ sở internet"],
-        "khong_phai": "Phát hiện vi phạm → xu_ly_vi_pham_hanh_chinh",
-    },
-    "thu_tuc_hanh_chinh": {
-        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["thu_tuc_hanh_chinh"],
-        "vi_du": ["Xin phép tổ chức lễ hội xã", "Hồ sơ tu bổ ngôi đình"],
-        "khong_phai": "Thủ tục chung → huong_dan_thu_tuc",
+        "vi_du": [
+            "Chính sách bảo trợ xã hội là gì?",
+            "Mục tiêu chương trình nông thôn mới?",
+            "Trẻ em bị bạo hành cần quy định can thiệp thế nào?",
+            "Bảo tồn di tích theo luật quy định ra sao?",
+        ],
+        "khong_phai": "Thủ tục nộp hồ sơ → huong_dan_thu_tuc",
     },
     "hoa_giai_van_dong": {
         "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["hoa_giai_van_dong"],
         "vi_du": ["Hàng xóm tranh chấp đất, hòa giải?", "Vận động dân chấp hành hương ước"],
         "khong_phai": "",
     },
-    "bao_ve_xa_hoi": {
-        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["bao_ve_xa_hoi"],
-        "vi_du": ["Trẻ em bị bố đánh, can thiệp ngay", "Người già bị bỏ rơi"],
-        "khong_phai": "Hỏi chính sách/quyền lợi → giai_thich_quy_dinh",
+    "hoi_dap_chung": {
+        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["hoi_dap_chung"],
+        "vi_du": ["Xin chào", "Công thức nấu ăn", "Tỷ giá USD"],
+        "khong_phai": "",
+    },
+    "huong_dan_thu_tuc": {
+        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["huong_dan_thu_tuc"],
+        "vi_du": ["Thủ tục xin phép lễ hội cấp xã?", "Mẫu đơn nộp ở đâu?", "Hồ sơ một cửa gồm gì?"],
+        "khong_phai": "",
+    },
+    "kiem_tra_ho_so": {
+        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["kiem_tra_ho_so"],
+        "vi_du": ["Đã nộp đơn, còn thiếu gì?", "Hồ sơ đủ chưa?"],
+        "khong_phai": "Chưa nộp, hỏi cần gì → huong_dan_thu_tuc",
+    },
+    "kiem_tra_thanh_tra": {
+        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["kiem_tra_thanh_tra"],
+        "vi_du": ["Kế hoạch kiểm tra đột xuất karaoke", "Đoàn thanh tra cơ sở internet"],
+        "khong_phai": "Đã có vi phạm cần xử phạt → xu_ly_vi_pham_hanh_chinh",
+    },
+    "so_sanh_van_ban": {
+        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["so_sanh_van_ban"],
+        "vi_du": ["Luật 2020 và 2025 khác gì?", "Đối chiếu hai nghị định"],
+        "khong_phai": "VB A thay thế VB B → document_meta_relation",
+    },
+    "soan_thao_van_ban": {
+        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["soan_thao_van_ban"],
+        "vi_du": ["Soạn công văn xin gia hạn", "Viết tờ trình"],
+        "khong_phai": "Báo cáo → tao_bao_cao",
+    },
+    "tao_bao_cao": {
+        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["tao_bao_cao"],
+        "vi_du": ["Lập báo cáo tổng kết năm", "Viết báo cáo phong trào"],
+        "khong_phai": "Công văn ngắn → soan_thao_van_ban",
+    },
+    "tom_tat_van_ban": {
+        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["tom_tat_van_ban"],
+        "vi_du": ["Tóm tắt Luật Đầu tư 2025", "Nội dung chính NĐ 144"],
+        "khong_phai": "Mục tiêu CT quốc gia → giai_thich_quy_dinh",
     },
     "to_chuc_su_kien_cong": {
         "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["to_chuc_su_kien_cong"],
-        "vi_du": ["Tổ chức Đại hội TDTT xã", "KH biểu diễn văn nghệ ngày lễ"],
-        "khong_phai": "Xin phép sự kiện → thu_tuc_hanh_chinh",
+        "vi_du": ["Tổ chức đại hội TDTT xã", "Kế hoạch biểu diễn ngày lễ"],
+        "khong_phai": "Kế hoạch quản lý chung → admin_planning",
     },
-    "bao_ton_phat_trien": {
-        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["bao_ton_phat_trien"],
-        "vi_du": ["Chùa hư hỏng sau bão, trùng tu", "Bảo tồn làng nghề truyền thống"],
-        "khong_phai": "Xin phép tu bổ → thu_tuc_hanh_chinh",
+    "tra_cuu_van_ban": {
+        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["tra_cuu_van_ban"],
+        "vi_du": ["Văn bản nào quy định về lễ hội?", "Tìm nghị định về quảng cáo"],
+        "khong_phai": "Đã rõ Điều Khoản → article_query",
     },
-    "hoi_dap_chung": {
-        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["hoi_dap_chung"],
-        "vi_du": ["Xin chào", "Bạn là ai?"],
-        "khong_phai": "",
+    "trich_xuat_van_ban": {
+        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["trich_xuat_van_ban"],
+        "vi_du": ["Các ngành nghề cấm đầu tư", "Liệt kê quyền nhà đầu tư"],
+        "khong_phai": "Một điều cụ thể → article_query",
+    },
+    "xu_ly_vi_pham_hanh_chinh": {
+        "mo_ta": INTENT_SEMANTIC_DESCRIPTIONS["xu_ly_vi_pham_hanh_chinh"],
+        "vi_du": ["Karaoke ồn quá giờ, xử phạt?", "Quảng cáo sai, xử lý?"],
+        "khong_phai": "Chỉ kế hoạch kiểm tra → kiem_tra_thanh_tra",
     },
 }
 
@@ -532,32 +521,13 @@ def _build_classification_prompt(query: str) -> str:
 
 ## QUY TẮC PHÂN LOẠI
 
-1. giai_thich_quy_dinh vs bao_ve_xa_hoi:
-   - "Chính sách X là gì?" → giai_thich_quy_dinh
-   - "Người X đang bị Y, cần can thiệp" → bao_ve_xa_hoi
-
-2. trich_xuat_van_ban vs article_query:
-   - "Các/Tất cả ngành nghề cấm" (liệt kê) → trich_xuat_van_ban
-   - "Điều 6 quy định gì?" (cụ thể) → article_query
-
-3. thu_tuc_hanh_chinh vs huong_dan_thu_tuc:
-   - Đặc thù cấp xã (lễ hội, tôn giáo, di tích) → thu_tuc_hanh_chinh
-   - Chung (đăng ký KD, xây dựng) → huong_dan_thu_tuc
-
-4. xu_ly_vi_pham vs kiem_tra_thanh_tra:
-   - Đã vi phạm, cần xử lý → xu_ly_vi_pham_hanh_chinh
-   - Kế hoạch kiểm tra → kiem_tra_thanh_tra
-
-5. so_sanh_van_ban vs document_relation:
-   - So sánh nội dung → so_sanh_van_ban
-   - Thay thế/sửa đổi → document_relation
-
-6. admin_planning vs to_chuc_su_kien_cong:
-   - Kế hoạch quản lý → admin_planning
-   - Tổ chức sự kiện cụ thể → to_chuc_su_kien_cong
-
-7. Nếu câu hỏi hỏi "thẩm quyền" + hành động cụ thể → xem xét intent theo hành động đó.
-8. Nếu câu hỏi lồng nhiều ý định → chọn intent PHÙ HỢP NHẤT với ý chính.
+1. trich_xuat_van_ban vs article_query: liệt kê toàn bộ mục trong luật → trich_xuat; một Điều/Khoản cụ thể → article_query.
+2. document_meta_relation vs so_sanh_van_ban: ai ban hành / thay thế sửa đổi / hiệu lực → document_meta_relation; so sánh nội dung chi tiết → so_sanh_van_ban.
+3. huong_dan_thu_tuc: mọi thủ tục, hồ sơ, mẫu đơn, thời hạn, UBND/một cửa, kể cả lễ hội–tôn giáo–di tích cấp xã.
+4. giai_thich_quy_dinh: giải thích chính sách, mục tiêu chương trình, quy định bảo vệ trẻ em/người yếu thế, bảo tồn di sản (theo văn bản).
+5. xu_ly_vi_pham_hanh_chinh vs kiem_tra_thanh_tra: đang xử lý vi phạm → xu_ly; kế hoạch/đoàn thanh tra → kiem_tra_thanh_tra.
+6. admin_planning vs to_chuc_su_kien_cong: kế hoạch quản lý chung → admin; tổ chức một sự kiện cụ thể → to_chuc_su_kien_cong.
+7. Chọn đúng một intent trong danh sách; ưu tiên ý chính của câu hỏi.
 
 ## CÂU HỎI
 
@@ -580,9 +550,11 @@ def _parse_llm_output(raw: str) -> Tuple[Optional[str], float]:
 
     raw_lower = raw.lower().strip()
 
-    intent_match = re.search(r"intent:\s*([a-z_]+)", raw_lower)
+    intent_match = re.search(r"intent:\s*([a-z0-9_]+)", raw_lower)
     if intent_match:
-        candidate = intent_match.group(1).strip()
+        candidate = normalize_legacy_intent(intent_match.group(1).strip())
+        if candidate == "nan":
+            return "nan", 0.85
         if candidate in VALID_INTENTS:
             return candidate, 0.85
 
@@ -601,11 +573,21 @@ def _parse_llm_output(raw: str) -> Tuple[Optional[str], float]:
 
 _TIER3_INTENT_KEYWORDS: Dict[str, List[str]] = {
     "xu_ly_vi_pham_hanh_chinh": ["xử phạt", "vi phạm hành chính", "mức phạt", "biên bản", "hình thức xử phạt"],
-    "bao_ve_xa_hoi": ["bạo lực gia đình", "bảo vệ trẻ em", "người cao tuổi", "người khuyết tật", "nạn nhân"],
     "to_chuc_su_kien_cong": ["lễ hội", "thể dục thể thao", "biểu diễn nghệ thuật", "sự kiện văn hóa"],
-    "bao_ton_phat_trien": ["di tích", "di sản", "bảo tồn", "trùng tu", "phát huy giá trị"],
-    "giai_thich_quy_dinh": ["chính sách", "quyền lợi", "chế độ", "bảo trợ xã hội", "an sinh"],
-    "thu_tuc_hanh_chinh": ["thủ tục", "đăng ký", "cấp phép", "hồ sơ", "sinh hoạt tôn giáo"],
+    "giai_thich_quy_dinh": [
+        "chính sách",
+        "quyền lợi",
+        "chế độ",
+        "bảo trợ xã hội",
+        "an sinh",
+        "bạo lực gia đình",
+        "bảo vệ trẻ em",
+        "di tích",
+        "di sản",
+        "bảo tồn",
+        "mục tiêu chương trình",
+    ],
+    "huong_dan_thu_tuc": ["thủ tục", "đăng ký", "cấp phép", "hồ sơ", "một cửa", "mẫu đơn", "sinh hoạt tôn giáo"],
     "kiem_tra_thanh_tra": ["kiểm tra", "thanh tra", "rà soát", "giám sát"],
     "hoa_giai_van_dong": ["hòa giải", "tranh chấp", "vận động", "nếp sống văn minh"],
     "trich_xuat_van_ban": ["cấm", "nghiêm cấm", "danh mục", "hành vi bị cấm"],
@@ -708,6 +690,9 @@ def _calibrate_confidence(
     query: str,
     method: str,
 ) -> float:
+    if intent == "nan":
+        return round(min(float(raw_confidence), 0.95), 2)
+
     conf = raw_confidence
 
     word_count = len(query.split())
@@ -716,7 +701,7 @@ def _calibrate_confidence(
     elif word_count <= 4 and method == "llm":
         conf = max(conf - 0.05, 0.50)
 
-    if intent in COMMUNE_LEVEL_INTENTS and method in ("llm", "semantic"):
+    if intent in COMMUNE_LEVEL_INTENTS and method in ("llm", "semantic", "classifier"):
         _BOOST_SIGNALS = [
             "địa bàn", "xã", "phường", "thôn", "ông/bà", "tham mưu",
             "ra quân", "vi phạm", "xử lý", "tình huống",
@@ -726,6 +711,17 @@ def _calibrate_confidence(
             conf = min(conf + 0.05, 0.95)
 
     return round(conf, 2)
+
+
+def _detect_intent_classifier(query: str) -> Optional[Tuple[str, float]]:
+    """Layer 2: mô hình PhoBERT cục bộ; None nếu tắt / lỗi / thấp hơn ngưỡng."""
+    try:
+        from app.services.intent_model_classifier import classify_intent_sync
+
+        return classify_intent_sync(query)
+    except Exception as exc:
+        log.debug("Intent classifier skipped: %s", exc)
+        return None
 
 
 # ══════════════════════════════════════════════════════════════
@@ -746,6 +742,7 @@ async def detect_intent_llm(query: str) -> Tuple[str, float]:
 
         intent, confidence = _parse_llm_output(raw)
         if intent:
+            intent, confidence = _finalize_detector_tuple(intent, confidence)
             log.info("LLM classified: %s (conf=%.2f)", intent, confidence)
             return intent, confidence
 
@@ -758,12 +755,7 @@ async def detect_intent_llm(query: str) -> Tuple[str, float]:
 
 
 async def detect_intent(query: str) -> Dict[str, object]:
-    """Main 3-tier intent detection pipeline.
-
-    Layer 0 → Guard (empty/noise)
-    Layer 1 → Structural (deterministic regex, ~0 ms)
-    Layer 2 → Semantic similarity (embedding cosine, ~2 ms)
-    Layer 3 → Zero-shot LLM (complex queries, ~1-3 s)
+    """Pipeline intent: guard → structural → classifier (tuỳ cấu hình) → semantic → LLM.
 
     Returns: {"intent": str, "confidence": float, "method": str}
     """
@@ -782,15 +774,15 @@ async def detect_intent(query: str) -> Dict[str, object]:
         log.warning("Noise query (no letters): '%s'", query)
         return {"intent": "hoi_dap_chung", "confidence": 0.15, "method": "guard"}
 
-    # ── Layer 1: Structural ─────────────────────────────────
-    structural_result = _detect_structural(query)
-    if structural_result:
-        intent, confidence = structural_result
-        calibrated = _calibrate_confidence(intent, confidence, query, "structural")
-        log.info("Structural intent: %s (conf=%.2f)", intent, calibrated)
-        return {"intent": intent, "confidence": calibrated, "method": "structural"}
+    # ── Layer 1: Fine-tuned classifier (PhoBERT) ─────────────
+    clf_result = _detect_intent_classifier(query)
+    if clf_result:
+        intent, confidence = clf_result
+        calibrated = _calibrate_confidence(intent, confidence, query, "classifier")
+        log.info("Classifier intent: %s (conf=%.2f)", intent, calibrated)
+        return {"intent": intent, "confidence": calibrated, "method": "classifier"}
 
-    # ── Layer 2: Semantic similarity ─────────────────────────
+    # ── Layer 2: Semantic similarity (prototypes) ─────────────
     semantic_result = _detect_semantic(query)
     if semantic_result:
         intent, confidence = semantic_result
@@ -798,7 +790,15 @@ async def detect_intent(query: str) -> Dict[str, object]:
         log.info("Semantic intent: %s (conf=%.2f)", intent, calibrated)
         return {"intent": intent, "confidence": calibrated, "method": "semantic"}
 
-    # ── Layer 3: Zero-shot LLM ───────────────────────────────
+    # ── Layer 3: Structural regex (YAML fallback) ───────────
+    structural_result = _detect_structural(query)
+    if structural_result:
+        intent, confidence = structural_result
+        calibrated = _calibrate_confidence(intent, confidence, query, "structural")
+        log.info("Structural intent: %s (conf=%.2f)", intent, calibrated)
+        return {"intent": intent, "confidence": calibrated, "method": "structural"}
+
+    # ── Layer 4: Zero-shot LLM ───────────────────────────────
     log.info("Calling LLM for intent classification: '%s'", query[:60])
     intent, confidence = await detect_intent_llm(query)
     calibrated = _calibrate_confidence(intent, confidence, query, "llm")
@@ -811,22 +811,26 @@ async def detect_intent(query: str) -> Dict[str, object]:
 # ══════════════════════════════════════════════════════════════
 
 def detect_intent_rule_based(query: str) -> Tuple[str, float]:
-    """Structural + semantic (embedding prototype) intent, không gọi LLM.
+    """Classifier → semantic → structural (YAML); không gọi LLM.
 
-    Dùng bởi `get_rag_intents()` để ánh xạ intent → cờ RAG (v3).
+    Dùng bởi `query_intent.compute_intent_bundle` / cờ RAG.
     """
     if not query or not query.strip():
         return "hoi_dap_chung", 0.10
 
     q = query.strip()
 
-    structural = _detect_structural(q)
-    if structural:
-        return structural
+    clf = _detect_intent_classifier(q)
+    if clf:
+        return _finalize_detector_tuple(*clf)
 
     semantic = _detect_semantic(q)
     if semantic:
         return semantic
+
+    structural = _detect_structural(q)
+    if structural:
+        return structural
 
     return "hoi_dap_chung", 0.30
 
@@ -835,41 +839,42 @@ def detect_intent_rule_based(query: str) -> Tuple[str, float]:
 # RAG FLAGS (v3) — ánh xạ intent → luồng rag_chain_v2
 # ══════════════════════════════════════════════════════════════
 
-_RAG_LEGAL_LOOKUP_INTENTS: frozenset = frozenset({"article_query"})
-
-_RAG_NEEDS_EXPANSION_INTENTS: frozenset = frozenset({
-    "tra_cuu_van_ban",
+# Cờ RAG — is_legal_lookup / needs_expansion / is_scenario theo nhóm intent;
+# use_multi_article: True cho mọi intent hợp lệ NGOẠI TRỪ nhóm tra cứu điều khoản/metadata (dưới).
+_RAG_LEGAL_LOOKUP_INTENTS: frozenset = frozenset({
+    "article_query",
+    "document_meta_relation",
+    "can_cu_phap_ly",
     "trich_xuat_van_ban",
-    "tom_tat_van_ban",
-    "program_goal",
-    "tao_bao_cao",
 })
 
-_RAG_MULTI_ARTICLE_INTENTS: frozenset = frozenset({
+_RAG_NEEDS_EXPANSION_INTENTS: frozenset = frozenset({
+    "giai_thich_quy_dinh",
+    "hoi_dap_chung",
     "so_sanh_van_ban",
-    "document_relation",
-    "can_cu_phap_ly",
-    "admin_planning",
-    "trich_xuat_van_ban",
+    "xu_ly_vi_pham_hanh_chinh",
 })
 
 _RAG_SCENARIO_INTENTS: frozenset = frozenset({
+    "huong_dan_thu_tuc",
+    "kiem_tra_ho_so",
     "xu_ly_vi_pham_hanh_chinh",
     "kiem_tra_thanh_tra",
-    "thu_tuc_hanh_chinh",
-    "hoa_giai_van_dong",
-    "bao_ve_xa_hoi",
+    "admin_planning",
     "to_chuc_su_kien_cong",
-    "bao_ton_phat_trien",
-    "kiem_tra_ho_so",
+    "hoa_giai_van_dong",
     "soan_thao_van_ban",
+    "tao_bao_cao",
     "giai_thich_quy_dinh",
-    "huong_dan_thu_tuc",
 })
 
 
 def map_intent_to_rag_flags(intent: str) -> Dict[str, bool]:
-    """Ánh xạ một intent (chuỗi) sang 4 cờ RAG. Intent không thuộc nhóm nào → tất cả False."""
+    """Ánh xạ intent → 4 cờ RAG. Intent không trong VALID_INTENTS → cả bốn False.
+
+    Quy tắc ``use_multi_article``: bật cho mọi intent hợp lệ **trừ** ``_RAG_LEGAL_LOOKUP_INTENTS``
+    (tra Điều/metadata/căn cứ/trích xuất — ưu tiên ngữ cảnh thu hẹp).
+    """
     if not intent or intent not in VALID_INTENTS:
         return {
             "is_scenario": False,
@@ -877,40 +882,22 @@ def map_intent_to_rag_flags(intent: str) -> Dict[str, bool]:
             "use_multi_article": False,
             "needs_expansion": False,
         }
+    legal_lookup = intent in _RAG_LEGAL_LOOKUP_INTENTS
     return {
-        "is_legal_lookup": intent in _RAG_LEGAL_LOOKUP_INTENTS,
+        "is_legal_lookup": legal_lookup,
         "needs_expansion": intent in _RAG_NEEDS_EXPANSION_INTENTS,
-        "use_multi_article": intent in _RAG_MULTI_ARTICLE_INTENTS,
+        "use_multi_article": not legal_lookup,
         "is_scenario": intent in _RAG_SCENARIO_INTENTS,
     }
 
 
 def get_rag_intents(query: str) -> Dict[str, bool]:
-    """Cờ RAG cho rag_chain_v2 — nguồn duy nhất: intent_detector (structural + semantic).
-
-    Gọi `detect_intent_rule_based` (embedding prototypes + regex cấu trúc), không dùng LLM.
-    """
+    """Cờ RAG — đồng bộ với ``query_intent.compute_intent_bundle``."""
     try:
-        q = query or ""
-        intent, _conf = detect_intent_rule_based(q)
-        flags = map_intent_to_rag_flags(intent)
+        from app.services.query_intent import compute_rag_flags_for_query
 
-        q_lower = q.lower()
-        multi_article_markers = [
-            "ngành, nghề đầu tư kinh doanh có điều kiện",
-            "ngành nghề đầu tư kinh doanh có điều kiện",
-            "danh mục ngành nghề",
-            "danh mục",
-            "bao gồm",
-            "liệt kê",
-            "các điều",
-            "những điều",
-        ]
-        if any(m in q_lower for m in multi_article_markers):
-            flags["needs_expansion"] = True
-            flags["use_multi_article"] = True
-
-        log.debug("get_rag_intents: intent=%s → %s", intent, flags)
+        flags = compute_rag_flags_for_query(query or "")
+        log.debug("get_rag_intents (query_intent): %s", flags)
         return flags
     except Exception as exc:
         log.warning("get_rag_intents failed: %s", exc)

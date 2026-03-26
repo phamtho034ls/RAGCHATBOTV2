@@ -36,6 +36,34 @@ def _get_client() -> AsyncOpenAI:
     return _client
 
 
+async def generate_with_messages_stream(
+    messages: List[dict[str, Any]],
+    temperature: float = 0.5,
+    model: Optional[str] = None,
+) -> AsyncGenerator[str, None]:
+    """Chat completion streaming — yield từng delta text."""
+    client = _get_client()
+    safe: List[dict] = []
+    for m in messages:
+        role = m.get("role", "user")
+        content = _sanitize_text(str(m.get("content", "")))
+        if content:
+            safe.append({"role": role, "content": content})
+    if not safe:
+        return
+    stream = await client.chat.completions.create(
+        model=model or OPENAI_MODEL,
+        messages=safe,
+        temperature=temperature,
+        max_tokens=MAX_TOKENS,
+        stream=True,
+    )
+    async for chunk in stream:
+        delta = chunk.choices[0].delta
+        if delta.content:
+            yield delta.content
+
+
 async def generate_stream(
     prompt: str,
     system: str = "",
@@ -66,11 +94,44 @@ async def generate_stream(
             yield delta.content
 
 
+async def generate_json_object(
+    user_prompt: str,
+    *,
+    system: str = "",
+    model: str | None = None,
+    max_tokens: int = 256,
+    temperature: float = 0.0,
+) -> dict[str, Any]:
+    """Chat completion với ``response_format: json_object`` — trả dict đã parse."""
+    import json as _json
+
+    client = _get_client()
+    messages: list[dict] = []
+    if system:
+        messages.append({"role": "system", "content": _sanitize_text(system)})
+    messages.append({"role": "user", "content": _sanitize_text(user_prompt)})
+
+    resp = await client.chat.completions.create(
+        model=model or OPENAI_MODEL,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        response_format={"type": "json_object"},
+    )
+    raw = (resp.choices[0].message.content or "").strip()
+    try:
+        return _json.loads(raw)
+    except Exception:
+        log.warning("generate_json_object: invalid JSON from model")
+        return {}
+
+
 async def generate(
     prompt: str,
     system: str = "",
     temperature: float = 0.5,
     model: str | None = None,
+    max_tokens: int | None = None,
 ) -> str:
     """Gọi OpenAI và trả toàn bộ response (non-stream)."""
     client = _get_client()
@@ -80,11 +141,12 @@ async def generate(
     messages.append({"role": "user", "content": _sanitize_text(prompt)})
 
     try:
+        mt = max_tokens if max_tokens is not None else MAX_TOKENS
         resp = await client.chat.completions.create(
             model=model or OPENAI_MODEL,
             messages=messages,
             temperature=temperature,
-            max_tokens=MAX_TOKENS,
+            max_tokens=mt,
         )
         return resp.choices[0].message.content or ""
     except Exception as exc:

@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import re
 
+from app.services.legal_scope import (
+    query_has_strong_legal_scope_signals,
+    should_block_out_of_domain_chat_pattern,
+)
+
 DOMAIN_HINT_PATTERNS = [
     r"điều\s+\d+",
     r"khoản\s+\d+",
@@ -56,12 +61,18 @@ def looks_like_follow_up(question: str) -> bool:
 
 def is_in_document_domain(question: str) -> bool:
     """Heuristic domain check before retrieval to reduce irrelevant calls."""
-    q = (question or "").strip().lower()
+    q_raw = (question or "").strip()
+    q = q_raw.lower()
     if not q:
         return False
 
-    if any(re.search(p, q) for p in OUT_OF_DOMAIN_CHAT_PATTERNS):
-        return False
+    # Luôn cho qua nếu có tín hiệu tra cứu pháp luật / hành chính (tránh chặn nhầm "du lịch" trong NĐ/Luật).
+    if query_has_strong_legal_scope_signals(q_raw):
+        return True
+
+    for pat in OUT_OF_DOMAIN_CHAT_PATTERNS:
+        if re.search(pat, q) and should_block_out_of_domain_chat_pattern(q_raw, pat):
+            return False
 
     if any(re.search(p, q) for p in DOMAIN_HINT_PATTERNS):
         return True

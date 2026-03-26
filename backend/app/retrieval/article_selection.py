@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
+import re
 from collections import deque
 from typing import Dict, List
+
+_AMEND_QUERY_HINT_RE = re.compile(
+    r"sửa\s*đổi|bổ\s*sung|thay\s*thế|đính\s*chính|"
+    r"những\s*điều\s*(?:được\s*)?(?:sửa|bổ\s*sung|thay)|"
+    r"điều\s*nào\s*(?:được\s*)?(?:sửa|bổ\s*sung|thay)",
+    re.IGNORECASE,
+)
 
 
 def _passage_rerank_score(p: Dict) -> float:
@@ -53,8 +61,10 @@ def diversify_by_article(reranked_passages: List[Dict], min_docs: int = 3) -> Li
     return out
 
 
-def dynamic_max_articles(reranked_passages: List[Dict]) -> int:
+def dynamic_max_articles(reranked_passages: List[Dict], query: str = "") -> int:
     """Quyết định số article/context nguồn: gap score thấp + nhiều doc → dùng nhiều nguồn."""
+    if _AMEND_QUERY_HINT_RE.search(query or ""):
+        return 5
     if len(reranked_passages) < 2:
         return 1
     s0 = _passage_rerank_score(reranked_passages[0])
