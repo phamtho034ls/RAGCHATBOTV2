@@ -61,3 +61,8 @@ backend/app/storage/
 data_clean.json
 data.json
 backend/tests/
+# =========================
+# Model
+# =========================
+backend/app/intent_model/
+*.safetensors
