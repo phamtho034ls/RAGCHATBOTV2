@@ -11,12 +11,104 @@ import logging
 import re
 from typing import Dict, List, Optional
 
-from sqlalchemy import select, text, func
+from sqlalchemy import select, text, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import Article, Clause, VectorChunk, Document
 
 log = logging.getLogger(__name__)
+
+# Cụm từ ưu tiên ILIKE trên toàn bộ nội dung Điều (khi chưa có search_vector).
+_LEGAL_ILIKE_PHRASES: tuple[str, ...] = (
+    "trợ giúp xã hội",
+    "hoạt động trợ giúp",
+    "đăng ký hoạt động",
+    "cơ sở trợ giúp",
+    "tiếng ồn",
+    "karaoke",
+    "đo độ ồn",
+    "xử phạt hành chính",
+)
+
+
+def _extract_ilike_terms(query: str) -> List[str]:
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    terms = list(_extract_keywords(query))
+    for ph in _LEGAL_ILIKE_PHRASES:
+        if ph in q:
+            terms.append(ph)
+    # Ưu tiên chuỗi dài (khớp cụm) trước từ rời
+    uniq: List[str] = []
+    seen = set()
+    for t in sorted(set(terms), key=len, reverse=True):
+        if t not in seen:
+            seen.add(t)
+            uniq.append(t)
+    return uniq[:12]
+
+
+async def _article_content_ilike_search(
+    query: str,
+    db: AsyncSession,
+    limit: int = 40,
+    doc_number: Optional[str] = None,
+) -> List[Dict]:
+    """Khi FTS (search_vector) không dùng được: ILIKE trực tiếp trên ``articles.content``."""
+    terms = _extract_ilike_terms(query)
+    if not terms:
+        return []
+
+    conds = []
+    for kw in terms:
+        if len(kw) >= 2:
+            conds.append(Article.content.ilike(f"%{kw}%"))
+
+    if not conds:
+        return []
+
+    stmt = (
+        select(
+            Article.id.label("article_id"),
+            Article.document_id,
+            Article.article_number,
+            Article.title.label("article_title"),
+            func.substr(Article.content, 1, 6000).label("chunk_text"),
+            Document.doc_number,
+            Document.title.label("document_title"),
+        )
+        .join(Document, Article.document_id == Document.id)
+        .where(or_(*conds))
+    )
+    if doc_number:
+        stmt = stmt.where(func.upper(func.trim(Document.doc_number)) == func.upper(func.trim(doc_number)))
+    stmt = stmt.limit(limit)
+
+    result = await db.execute(stmt)
+    rows = result.mappings().all()
+    out: List[Dict] = []
+    for row in rows:
+        txt = row["chunk_text"] or ""
+        score = sum(1 for t in terms if t.lower() in txt.lower()) / max(len(terms), 1)
+        out.append(
+            {
+                "id": f"ailike-{row['article_id']}",
+                "score": float(score),
+                "text_chunk": txt,
+                "document_id": row["document_id"],
+                "article_id": row["article_id"],
+                "clause_id": None,
+                "doc_number": row["doc_number"],
+                "document_title": row["document_title"] or "",
+                "article_number": _normalize_article_number(row["article_number"]),
+                "article_title": row["article_title"] or "",
+                "clause_number": None,
+            }
+        )
+    out.sort(key=lambda x: x["score"], reverse=True)
+    log.debug("Article ILIKE fallback returned %d rows", len(out))
+    return out
 
 
 async def full_text_search(
@@ -110,6 +202,13 @@ async def keyword_search(
     if fts_hits:
         log.debug("Keyword path: FTS articles returned %d hits", len(fts_hits))
         return fts_hits[:top_k]
+
+    article_ilike = await _article_content_ilike_search(
+        query, db, limit=top_k * 2, doc_number=doc_number
+    )
+    if article_ilike:
+        log.debug("Keyword path: article ILIKE returned %d hits", len(article_ilike))
+        return article_ilike[:top_k]
 
     if not keywords:
         return []

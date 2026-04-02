@@ -301,9 +301,13 @@ async def summarize_matched_document(
         f"- Phạm vi điều chỉnh\n"
         f"- Đối tượng áp dụng\n"
         f"- Nhóm quy định chính\n"
-        f"- Điểm cần lưu ý khi thực thi\n\n"
+        f"- Điểm cần lưu ý khi thực thi\n"
+        f"- Điều/Khoản trọng yếu và nội dung quy định tương ứng\n\n"
         f"Văn bản: {doc.title or ''} ({doc.doc_number or ''})\n\n"
-        f"Nội dung trích từ các điều:\n{document_text}"
+        f"Nội dung trích từ các điều:\n{document_text}\n\n"
+        f"YÊU CẦU BẮT BUỘC:\n"
+        f"- Không chỉ liệt kê số điều; phải nêu nội dung quy định tương ứng.\n"
+        f"- Không bịa đặt nội dung ngoài phần trích."
     )
     summary = await generate(
         prompt=prompt,

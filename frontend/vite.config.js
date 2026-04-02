@@ -9,6 +9,18 @@ export default defineConfig({
       "/api": {
         target: "http://localhost:8000",
         changeOrigin: true,
+        // Tránh buffer SSE khi dev qua Vite — nếu không, cả response stream có thể tới một lần.
+        configure: (proxy) => {
+          proxy.on("proxyRes", (proxyRes, req) => {
+            if (
+              req.url?.includes("/stream") &&
+              proxyRes.headers["content-type"]?.includes("text/event-stream")
+            ) {
+              proxyRes.headers["x-accel-buffering"] = "no";
+              delete proxyRes.headers["content-length"];
+            }
+          });
+        },
       },
     },
   },

@@ -512,42 +512,32 @@ async def _handle_commune_level(
     }
 
 
-async def _handle_ninh_binh_info(
-    question: str,
-    temperature: float,
-    dataset_id: Optional[str],
-    conversation_id: Optional[str] = None,
-    utterance_labels: Optional[Any] = None,
-) -> Dict[str, Any]:
-    """Tra cứu thông tin chung về tỉnh Ninh Bình (phi pháp lý)."""
-    from app.tools.ninh_binh_search_tool import run as ninh_binh_run
-
-    result = await ninh_binh_run(question)
-    return {
-        "answer": result.get("result", ""),
-        "sources": result.get("sources", []),
-        "metadata": {"pipeline": "ninh_binh_search_tool"},
-    }
-
-
 # ── Route Map ───────────────────────────────────────────────
+# Gồm nhãn fine-grained (legacy) và 8 nhóm từ multitask / normalize_legacy_intent.
 ROUTE_MAP = {
-    "ninh_binh_info": _handle_ninh_binh_info,
     "admin_planning": _handle_admin_planning,
+    "admin_scenario": _handle_admin_planning,
     "tra_cuu_van_ban": _handle_tra_cuu_van_ban,
+    "legal_lookup": _handle_tra_cuu_van_ban,
     "can_cu_phap_ly": _handle_can_cu_phap_ly,
     "giai_thich_quy_dinh": _handle_giai_thich_quy_dinh,
+    "legal_explanation": _handle_giai_thich_quy_dinh,
     "huong_dan_thu_tuc": _handle_huong_dan_thu_tuc,
+    "procedure": _handle_huong_dan_thu_tuc,
     "kiem_tra_ho_so": _handle_kiem_tra_ho_so,
     "tom_tat_van_ban": _handle_tom_tat_van_ban,
+    "summarization": _handle_tom_tat_van_ban,
     "so_sanh_van_ban": _handle_so_sanh_van_ban,
+    "comparison": _handle_so_sanh_van_ban,
     "tao_bao_cao": _handle_tao_bao_cao,
     "soan_thao_van_ban": _handle_soan_thao_van_ban,
+    "document_generation": _handle_soan_thao_van_ban,
     "trich_xuat_van_ban": _handle_trich_xuat_van_ban,
     "document_meta_relation": _handle_tra_cuu_van_ban,
     "article_query": _handle_tra_cuu_van_ban,
     "out_of_scope": _handle_out_of_scope,
     # Commune-level intents → VHXH officer pipeline
+    "violation": _handle_commune_level,
     "xu_ly_vi_pham_hanh_chinh": _handle_commune_level,
     "kiem_tra_thanh_tra": _handle_commune_level,
     "hoa_giai_van_dong": _handle_commune_level,

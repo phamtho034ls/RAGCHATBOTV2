@@ -95,10 +95,35 @@ from app.tools import draft_tool
 
 log = logging.getLogger(__name__)
 
+
+async def _collect_llm_stream_to_queue(
+    stream_queue: Optional[asyncio.Queue],
+    stream_gen: AsyncGenerator[str, None],
+) -> str:
+    """Đọc generator token LLM; nếu có queue thì put từng delta (SSE). Trả về full text."""
+    parts: List[str] = []
+    async for delta in stream_gen:
+        if not delta:
+            continue
+        parts.append(delta)
+        if stream_queue is not None:
+            await stream_queue.put(delta)
+    return "".join(parts)
+
 _STREAM_SENTINEL = object()
 
 # Ngưỡng độ tin cậy để chọn câu hỏi gợi ý cuối câu trả lời (thấp vs cao).
 FOLLOWUP_LOW_CONFIDENCE_THRESHOLD = 0.5
+_LEGAL_CONTENT_REQUIRED_INTENTS: frozenset[str] = frozenset(
+    {
+        "legal_lookup",
+        "legal_explanation",
+        "procedure",
+        "violation",
+        "comparison",
+        "summarization",
+    }
+)
 
 
 async def _persist_conv_turn(db: AsyncSession, conv_id: str, query: str, answer: str) -> None:
@@ -891,6 +916,8 @@ async def _answer_commune_officer_query(
     doc_number: Optional[str],
     legal_domains: Optional[List[str]] = None,
     retrieval_query: Optional[str] = None,
+    stream_queue: Optional[asyncio.Queue] = None,
+    conv_id: Optional[str] = None,
 ) -> Dict:
     """Handle commune-level administrative queries using the VHXH officer pipeline.
 
@@ -932,11 +959,24 @@ async def _answer_commune_officer_query(
             violation=situation.get("violation", "không có"),
             severity=situation.get("severity", "chưa xác định"),
         )
-        answer = await generate(
-            prompt=prompt,
-            system=COMMUNE_OFFICER_SYSTEM_PROMPT,
-            temperature=min(temperature, 0.3),
-        )
+        _temp = min(temperature, 0.3)
+        if stream_queue is not None and conv_id:
+            await _stream_emit_hybrid_prelude(stream_queue, conv_id, [])
+        if stream_queue is not None:
+            answer = await _collect_llm_stream_to_queue(
+                stream_queue,
+                generate_stream(
+                    prompt=prompt,
+                    system=COMMUNE_OFFICER_SYSTEM_PROMPT,
+                    temperature=_temp,
+                ),
+            )
+        else:
+            answer = await generate(
+                prompt=prompt,
+                system=COMMUNE_OFFICER_SYSTEM_PROMPT,
+                temperature=_temp,
+            )
         answer = sanitize_rag_llm_output(answer)
         return {"answer": answer, "sources": [], "confidence_score": 0.4}
 
@@ -953,11 +993,24 @@ async def _answer_commune_officer_query(
         severity=situation.get("severity", "chưa xác định"),
     )
 
-    answer = await generate(
-        prompt=prompt,
-        system=COMMUNE_OFFICER_SYSTEM_PROMPT,
-        temperature=min(temperature, 0.3),
-    )
+    _temp = min(temperature, 0.3)
+    if stream_queue is not None and conv_id:
+        await _stream_emit_hybrid_prelude(stream_queue, conv_id, sources)
+    if stream_queue is not None:
+        answer = await _collect_llm_stream_to_queue(
+            stream_queue,
+            generate_stream(
+                prompt=prompt,
+                system=COMMUNE_OFFICER_SYSTEM_PROMPT,
+                temperature=_temp,
+            ),
+        )
+    else:
+        answer = await generate(
+            prompt=prompt,
+            system=COMMUNE_OFFICER_SYSTEM_PROMPT,
+            temperature=_temp,
+        )
     answer = sanitize_rag_llm_output(answer)
 
     context_nums = _collect_context_doc_numbers(passages)
@@ -1015,26 +1068,6 @@ async def rag_query(
         created = await conv_repo.create_conversation(db, title=None)
         conv_id = created["id"]
 
-    # ── 0. Ninh Bình tool: câu hỏi phi pháp lý về Ninh Bình (địa lý, huyện, du lịch...)
-    from app.services.ninh_binh_router import should_use_ninh_binh_tool, route_to_ninh_binh
-    if should_use_ninh_binh_tool(query):
-        nb_result = await route_to_ninh_binh(query)
-        if nb_result:
-            latency = (time.time() - start_time) * 1000
-            result = {
-                "answer": _append_followup_prompts(
-                    nb_result.get("answer", "") or "",
-                    0.85,
-                    has_sources=bool(nb_result.get("sources")),
-                ),
-                "sources": nb_result.get("sources", []),
-                "confidence_score": 0.85,
-            }
-            await log_interaction(db, query, result.get("answer", "") or "", [], 0.85, latency)
-            await _persist_conv_turn(db, conv_id, query, result.get("answer", "") or "")
-            await _stream_emit_complete(stream_queue, conv_id, result)
-            return _with_conv_meta(result, conv_id)
-
     analysis = analyze_query(query)
     if utterance_labels is not None:
         from app.services.query_route_classifier import merge_utterance_labels_into_analysis
@@ -1082,8 +1115,7 @@ async def rag_query(
 
     # ── 1b. RAG intent flags — cùng nguồn với analyze_query (query_intent bundle) ──
     log.info(
-        "RAG intents (query_intent / analysis): scenario=%s legal_lookup=%s multi_article=%s needs_expansion=%s",
-        rag_intents.get("is_scenario"),
+        "RAG intents (query_intent / analysis): legal_lookup=%s multi_article=%s needs_expansion=%s",
         rag_intents.get("is_legal_lookup"),
         rag_intents.get("use_multi_article"),
         rag_intents.get("needs_expansion"),
@@ -1138,9 +1170,8 @@ async def rag_query(
 
     commune_situation = analysis.get("commune_situation")
     legacy_commune_hint = (
-        intent in COMMUNE_LEVEL_INTENTS
+        detector_intent in COMMUNE_LEVEL_INTENTS
         or (commune_situation and commune_situation.get("violation", "không có") != "không có")
-        or rag_intents.get("is_scenario", False)
     )
     if query_requires_multi_document_synthesis(query) or _query_requires_direct_legal_lookup(query):
         is_commune_query = False
@@ -1157,6 +1188,8 @@ async def rag_query(
             doc_number=doc_number,
             legal_domains=domain_filter,
             retrieval_query=rewritten_query,
+            stream_queue=stream_queue,
+            conv_id=conv_id,
         )
         await cache_answer(query, result)
         latency = (time.time() - start_time) * 1000
@@ -1171,7 +1204,10 @@ async def rag_query(
             doc_numbers, result.get("confidence_score", 0.0), latency,
         )
         await _persist_conv_turn(db, conv_id, query, result.get("answer", "") or "")
-        await _stream_emit_complete(stream_queue, conv_id, result)
+        if stream_queue is not None:
+            await _stream_emit_finalize(stream_queue, result, False)
+        else:
+            await _stream_emit_complete(stream_queue, conv_id, result)
         return _with_conv_meta(result, conv_id)
 
     # Intent-specific routes
@@ -1274,38 +1310,36 @@ async def rag_query(
         multi_article_conditions = True
         use_multi = True
 
-    # When multiple strategies selected and not already handled by intents,
-    # run them in parallel for richer context coverage.
-    _use_parallel = (
-        len(_selected_strategies) >= 2
-        and not use_multi
-        and not multi_article_conditions
-        and STRATEGY_LOOKUP not in _selected_strategies  # lookup still uses single-path
+    # Unified retrieval path (single stable flow):
+    # 1) always run broad hybrid (DB + vector + keyword),
+    # 2) optionally enrich with multi-query,
+    # 3) merge+dedup+sort once.
+    base_passages = await hybrid_search(
+        query=_retrieval_query,
+        db=db,
+        top_k=30,
+        doc_number=doc_number,
+        legal_domains=domain_filter,
+        single_article_only=False,
+        max_articles=MULTI_ARTICLE_MAX_ARTICLES,
     )
-
+    passages = list(base_passages)
     if use_multi:
-        passages = await _multi_query_retrieve(
-            query=_retrieval_query, db=db, doc_number=doc_number,
-            legal_domains=domain_filter,
-            force_expansion=use_multi,
-        )
-    elif _use_parallel:
-        passages = await _parallel_retrieve_all(
+        multi_passages = await _multi_query_retrieve(
             query=_retrieval_query,
             db=db,
-            strategies=_selected_strategies,
+            top_k=30,
             doc_number=doc_number,
             legal_domains=domain_filter,
+            force_expansion=True,
         )
-    else:
-        passages = await hybrid_search(
-            query=_retrieval_query,
-            db=db,
-            doc_number=doc_number,
-            legal_domains=domain_filter,
-            single_article_only=not multi_article_conditions,
-            max_articles=MULTI_ARTICLE_MAX_ARTICLES if multi_article_conditions else None,
-        )
+        passages.extend(multi_passages)
+    passages = dedup_chunks(passages)
+    passages.sort(
+        key=lambda p: float(p.get("rerank_score", p.get("rrf_score", p.get("score", 0.0)))),
+        reverse=True,
+    )
+    passages = passages[:60]
 
     # If user cites explicit document number, do not answer from other documents.
     strict_doc_passages = _passages_match_explicit_doc_ref(passages, query)
@@ -1354,21 +1388,23 @@ async def rag_query(
             passages = passages_retry
 
     # ── 3. Build context ─────────────────────────────────
-    if not passages and query_looks_procedural(query):
-        # Procedural queries are brittle with strict domain filters/doc constraints:
-        # retry once with relaxed filters before returning NO_INFO.
-        log.info("Procedural query with empty retrieval — retrying relaxed search.")
-        relaxed_doc = None
-        if doc_number:
-            relaxed_doc = doc_number
+    if not passages and (
+        query_looks_procedural(query) or _extract_doc_reference_from_query(query)
+    ):
+        # Lọc domain / strict doc có thể làm rỗng; câu có số văn bản hoặc thủ tục — thử lại không domain.
+        log.info("Empty retrieval — relaxed hybrid (procedural or explicit document in query).")
+        relaxed_doc = doc_number or _extract_doc_reference_from_query(query)
         passages = await hybrid_search(
             query=query,
             db=db,
+            top_k=40,
             doc_number=relaxed_doc,
             legal_domains=None,
             single_article_only=False,
             max_articles=MULTI_ARTICLE_MAX_ARTICLES,
         )
+        if _extract_doc_reference_from_query(query):
+            passages = _passages_match_explicit_doc_ref(passages, query)
 
     if not passages:
         answer = _append_followup_prompts(NO_INFO_MESSAGE, 0.0, has_sources=False)
@@ -1400,6 +1436,21 @@ async def rag_query(
         context = _build_context(passages)
     sources = _extract_sources(passages)
 
+    _dc = dedup_chunks(passages)
+    _grp = group_chunks_by_article(_dc)
+    log.info(
+        "Retrieval counts | passages=%d dedup_chunks=%d article_groups=%d sources=%d | "
+        "use_multi=%s multi_article=%s needs_expansion=%s | q=%.100r",
+        len(passages),
+        len(_dc),
+        len(_grp),
+        len(sources),
+        use_multi,
+        multi_article_conditions,
+        rag_intents.get("needs_expansion", False),
+        (query or "")[:120],
+    )
+
     # Query type: user asks "which legal document(s)".
     if _is_document_lookup_query(query):
         answer = _build_document_lookup_answer(sources)
@@ -1427,6 +1478,8 @@ async def rag_query(
         for m in hist
         if m.get("role") in ("user", "assistant")
     ]
+    if stream_queue is not None:
+        await _stream_emit_hybrid_prelude(stream_queue, conv_id, sources)
     if conv_messages:
         messages = (
             [{"role": "system", "content": SYSTEM_PROMPT_V2}]
@@ -1434,24 +1487,22 @@ async def rag_query(
             + [{"role": "user", "content": prompt}]
         )
         if stream_queue is not None:
-            await _stream_emit_hybrid_prelude(stream_queue, conv_id, sources)
-            answer = ""
-            async for delta in generate_with_messages_stream(messages, temperature=temperature):
-                answer += delta
-                await stream_queue.put(delta)
+            answer = await _collect_llm_stream_to_queue(
+                stream_queue,
+                generate_with_messages_stream(messages, temperature=temperature),
+            )
         else:
             answer = await generate_with_messages(messages, temperature=temperature)
     else:
         if stream_queue is not None:
-            await _stream_emit_hybrid_prelude(stream_queue, conv_id, sources)
-            answer = ""
-            async for delta in generate_stream(
-                prompt=prompt,
-                system=SYSTEM_PROMPT_V2,
-                temperature=temperature,
-            ):
-                answer += delta
-                await stream_queue.put(delta)
+            answer = await _collect_llm_stream_to_queue(
+                stream_queue,
+                generate_stream(
+                    prompt=prompt,
+                    system=SYSTEM_PROMPT_V2,
+                    temperature=temperature,
+                ),
+            )
         else:
             answer = await generate(
                 prompt=prompt,
@@ -1585,6 +1636,41 @@ async def rag_query(
 
     # ── 8. Ensure legal citations (no auto-inserted DB document list in body) ─────
     answer = _ensure_legal_citations(answer, sources)
+
+    # ── 8b. Legal-content output guard: must include Article + content for legal intents ──
+    if (
+        intent in _LEGAL_CONTENT_REQUIRED_INTENTS
+        and passages
+        and not _is_no_info_answer(answer)
+        and not _answer_has_article_content(answer)
+    ):
+        log.warning(
+            "Output guard: missing article-content pair for intent=%s, regenerating once.",
+            intent,
+        )
+        strict_legal_prompt = (
+            f"{_build_rag_user_prompt(query, context)}\n\n"
+            "━━ BẮT BUỘC ĐỊNH DẠNG NỘI DUNG ĐIỀU LUẬT ━━\n"
+            "Phần trả lời PHẢI có ít nhất một mục 'Điều X' kèm nội dung quy định cụ thể. "
+            "Không được chỉ liệt kê tên văn bản hoặc danh sách điều trống.\n"
+        )
+        regen = await generate(
+            prompt=strict_legal_prompt,
+            system=SYSTEM_PROMPT_V2,
+            temperature=0.0,
+        )
+        regen = sanitize_rag_llm_output(regen)
+        regen = _force_no_info_if_needed(regen)
+        regen = strip_answer_lines_with_hallucinated_doc_numbers(
+            regen,
+            _collect_context_doc_numbers(passages),
+        )
+        if regen and not _is_no_info_answer(regen) and _answer_has_article_content(regen):
+            answer = _ensure_legal_citations(regen, sources)
+        else:
+            log.warning(
+                "Output guard regeneration did not satisfy article-content requirement; keeping prior answer."
+            )
     answer = _ensure_response_format(answer)
 
     # ── 9. Compute confidence + V3 retry (multi-article) / fallback ──
@@ -1844,6 +1930,19 @@ def _ensure_legal_citations(answer: str, sources: List[Dict]) -> str:
         # Đã có mục căn cứ ở giữa bài (vd. pipeline cán bộ xã) — không thêm khối trùng
         return answer
     return f"{trimmed}\n\n{citation_block}"
+
+
+def _answer_has_article_content(answer: str) -> bool:
+    """Heuristic guard: answer must include article reference + non-trivial content."""
+    a = (answer or "").strip().lower()
+    if not a:
+        return False
+    if not re.search(r"\bđiều\s+\d+[a-z]?\b", a):
+        return False
+    # Require some substantive text after an article marker.
+    return bool(
+        re.search(r"\bđiều\s+\d+[a-z]?\b[\s:.\-–—]*.{20,}", a, re.IGNORECASE | re.DOTALL)
+    )
 
 
 def _append_followup_prompts(

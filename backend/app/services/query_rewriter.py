@@ -102,6 +102,10 @@ def _is_safe_rewrite(original: str, rewritten: str) -> bool:
     # Rewrite should not end with a colon (means truncation) or be longer than 300 chars
     if rewritten.endswith(":") or len(rewritten) > 300:
         return False
+    # Cắt giữa từ (vd. "pháp luật V" thay vì Việt Nam)
+    tail = rewritten.rstrip()
+    if re.search(r"(?:pháp\s*luật|luật)\s+[A-ZĐa-zà-ỹ]\s*$", tail, re.IGNORECASE):
+        return False
     return True
 
 
@@ -136,7 +140,7 @@ async def rewrite_query(query: str) -> str:
             prompt=prompt,
             system=_REWRITE_SYSTEM,
             temperature=0.0,
-            max_tokens=160,
+            max_tokens=240,
         )
         rewritten = (rewritten or "").strip()
 

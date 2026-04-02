@@ -118,6 +118,21 @@ export async function chatStream(
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  /** Gom token trong một khung hình — tránh React 18 gộp hàng trăm setState trong một chunk SSE. */
+  let tokenBatch = "";
+  let rafId = null;
+  const flushTokenBatch = () => {
+    rafId = null;
+    if (tokenBatch && onToken) {
+      const chunk = tokenBatch;
+      tokenBatch = "";
+      onToken(chunk);
+    }
+  };
+  const scheduleTokenFlush = () => {
+    if (rafId != null) return;
+    rafId = requestAnimationFrame(flushTokenBatch);
+  };
 
   while (true) {
     const { done, value } = await reader.read();
@@ -133,6 +148,11 @@ export async function chatStream(
       const payload = trimmed.slice(6);
 
       if (payload === "[DONE]") {
+        if (rafId != null) {
+          cancelAnimationFrame(rafId);
+          rafId = null;
+        }
+        flushTokenBatch();
         onDone?.();
         return;
       }
@@ -152,6 +172,11 @@ export async function chatStream(
               continue;
             }
             if (inner.type === "text_finalize") {
+              if (rafId != null) {
+                cancelAnimationFrame(rafId);
+                rafId = null;
+              }
+              flushTokenBatch();
               onTextFinalize?.(inner);
               continue;
             }
@@ -162,13 +187,19 @@ export async function chatStream(
           } catch {
             // Not JSON – it's a regular token
           }
-          onToken?.(data.token);
+          tokenBatch += data.token;
+          scheduleTokenFlush();
         }
       } catch {
         // Ignore parse errors
       }
     }
   }
+  if (rafId != null) {
+    cancelAnimationFrame(rafId);
+    rafId = null;
+  }
+  flushTokenBatch();
   onDone?.();
 }
 

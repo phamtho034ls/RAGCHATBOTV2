@@ -1,6 +1,6 @@
 # Government AI Copilot — Trợ lý hành chính & RAG văn bản pháp luật
 
-Hệ thống **RAG production** cho cán bộ VHXH: **PostgreSQL** (metadata + full-text `articles`), **Qdrant** (vector), **Redis** (cache), **hybrid retrieval** (semantic + FTS/ILIKE → RRF → rerank), **OpenAI API** cho LLM. Giao diện web tiếng Việt (React/Vite); API `**/api/chat`** / `**/api/chat/stream`** là đường chính — `**rag_chain_v2**`. Stream hiện tại là **pseudo-stream** (chia nhỏ câu trả lời sau khi LLM xong), không stream token trực tiếp từ OpenAI.
+Hệ thống **RAG production** cho cán bộ VHXH: **PostgreSQL** (metadata + full-text `articles`), **Qdrant** (vector), **Redis** (cache), **hybrid retrieval** (semantic + FTS/ILIKE → RRF → rerank), **OpenAI API** cho LLM. Giao diện web tiếng Việt (React/Vite); API `**/api/chat`** / `**/api/chat/stream`** là đường chính — `**rag_chain_v2`**. Stream hiện tại là **pseudo-stream** (chia nhỏ câu trả lời sau khi LLM xong), không stream token trực tiếp từ OpenAI.
 
 - **API:** FastAPI `Government AI Copilot API`, version `2.0.0`
 - **Module SQLite/FAISS/langchain v1:** đã gỡ; chỉ còn stack async v2
@@ -43,7 +43,7 @@ flowchart TB
 | Thành phần                      | Vai trò                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Frontend**                    | React 18 + Vite + Tailwind; gọi `**/api/chat/stream`** (body: `question`, `temperature`, tuỳ chọn `conversation_id`)                                                                                                                                                                                                                                                                                                                                                        |
-| `**rag_chain_v2`**              | Pipeline chat production: `analyze_query` → OOS → domain + cache → **(cache miss)** `rewrite_query` + `extract_query_features` / `strategy_router` → commune arbiter → checklist/draft/summary hoặc hybrid / `**_parallel_retrieve_all`** (tuỳ điểm strategy) → neo chủ đề / full-article → LLM → `**validate_answer**` (LLM) + `validate_article_completeness` — retrieval checklist/commune dùng `retrieval_query` đã rewrite; không chèn danh sách văn bản CSDL vào body |
+| `**rag_chain_v2`**              | Pipeline chat production: `conversation_id` → `analyze_query` → OOS → domain + Redis cache → **(cache miss)** `rewrite_query` + `extract_query_features` / `strategy_router` → commune arbiter → checklist / draft / summary **hoặc** `hybrid_search` ± `_multi_query_retrieve` (theo `rag_flags` + strategy) → neo chủ đề / full-article → LLM → `validate_article_completeness` + chống ảo + `validate_answer` (LLM) — checklist/commune dùng `retrieval_query` đã rewrite; không chèn danh sách văn bản CSDL vào body |
 | `**query_rewriter.py**`         | Viết lại câu hỏi tiếng Việt trang trọng cho retrieval (sau cache miss; bỏ qua khi `document_drafting` / `document_summary`).                                                                                                                                                                                                                                                                                                                                                |
 | `**query_features.py**`         | Regex/feature: `Điều`, khoản, số văn bản, procedure, so sánh, giải thích, độ dài câu, …                                                                                                                                                                                                                                                                                                                                                                                     |
 | `**strategy_router.py**`        | `compute_strategy_scores` → `select_strategies` (`lookup` / `semantic` / `multi_query`) — bổ sung cho `rag_flags`, không thay thế `analyze_query`.                                                                                                                                                                                                                                                                                                                          |
@@ -72,6 +72,117 @@ flowchart TB
 
 ---
 
+## Pipeline hệ thống — phân tích chi tiết
+
+Phần này bám **mã nguồn** trong `backend/app` (FastAPI + pipeline ingest + `rag_chain_v2`). Hai trục chính: **đưa văn bản vào kho** (PostgreSQL + Qdrant) và **trả lời câu hỏi** (hybrid retrieval + LLM).
+
+### 1. Ingestion — từ DOCX đến DB và vector
+
+**Điểm vào:** `pipeline/ingestor.py` → `ingest_document()` (thường qua `routers/document_router_v2` upload).
+
+| Bước | Giai đoạn | Module / hàm | Nội dung |
+|------|-----------|--------------|----------|
+| 1 | Parse | `parser/docx_parser.read_docx` | Trích văn bản từ DOCX |
+| 2 | Làm sạch + số hiệu | `pipeline/cleaner.clean_text`, regex trong `ingestor` | Chuẩn hóa text, suy ra `doc_number` từ tên file / phần đầu văn bản |
+| 3 | Cấu trúc pháp luật | `pipeline/legal_parser.build_article_tree` | Cây **Điều / Khoản**; không phát hiện Điều → ingest hủy |
+| 3b | Gán nhãn chủ đề văn bản | `domain_classifier.classify_document_law_intents` | Đa nhãn `law_intents` (cùng từ vựng miền pháp lý); `legal_domain` = phần tử đầu — lưu PostgreSQL và payload Qdrant |
+| 4 | Bản ghi tài liệu | `pipeline/db_writer.insert_document` | Bảng `documents` (metadata, `law_intents` JSON, …) |
+| 5 | Chuẩn hóa quan hệ | `insert_chapters`, `insert_sections_from_articles`, `insert_articles`, `insert_clauses` | Thứ bậc chương / mục / điều / khoản trong PG |
+| 6 | Chunk cho RAG | `pipeline/chunk_generator.generate_clause_chunks` | Chunk theo khoản, gắn metadata điều, tiêu đề, số văn bản |
+| 7 | Embedding | `pipeline/embedding.embed_texts` | Mô hình sentence-transformers (768 chiều, cấu hình trong `config`) |
+| 8 | Vector store | `pipeline/vector_store.upsert_vectors` | Ghi Qdrant kèm payload (`doc_number`, `legal_domain`, `law_intents`, `article_number`, …) |
+| 9 | Đồng bộ chunk PG | `insert_chunks` | Bảng `vector_chunks`, giữ `vector_id` khớp Qdrant |
+
+```mermaid
+flowchart LR
+  DOCX[DOCX] --> P[read_docx]
+  P --> C[clean_text + doc_number]
+  C --> T[build_article_tree]
+  T --> LC[classify_document_law_intents]
+  LC --> DB[(PostgreSQL)]
+  T --> CH[generate_clause_chunks]
+  CH --> E[embed_texts]
+  E --> Q[(Qdrant)]
+  CH --> DB
+```
+
+### 2. Hybrid retrieval — bên trong `hybrid_search`
+
+**File:** `retrieval/hybrid_retriever.py` → `hybrid_search()`.
+
+- **Vector:** `vector_retriever.vector_search` — Qdrant, có lọc `legal_domains`, `doc_number` khi có.
+- **Keyword:** `keyword_retriever.keyword_search` — ưu tiên FTS trên `articles.search_vector` (PostgreSQL), lỗi/thiếu chỉ mục thì fallback ILIKE trên `vector_chunks`.
+- **Gộp thứ hạng:** RRF giữa hai nguồn; có nhánh **lookup Điều / văn bản** trực tiếp từ DB khi truy vấn mang mốc rõ (số hiệu, Điều).
+- **Rerank:** `reranker.rerank` — FlagReranker, fallback CrossEncoder.
+- **Sau rerank:** điều chỉnh điểm theo khớp `legal_domain` / `law_intents` với domain câu hỏi, penalty chủ đề lệch (`TOPIC_MISMATCH_PENALTY`), `diversify_by_article` và `dynamic_max_articles`. Văn bản **sửa đổi, bổ sung** có nhánh mở rộng lấy thêm Điều (cấu hình `RAG_AMENDMENT_*`).
+
+### 3. Chat production — `rag_chain_v2.rag_query` / `rag_query_stream`
+
+**HTTP:** `routers/chat_router.py` — `POST /api/chat` và `POST /api/chat/stream`. `ChatRequest` chấp nhận `query` hoặc `question` (frontend thường gửi `question`).
+
+**Stream:** `rag_query_stream` dùng hàng đợi nội bộ: phát **meta** (gồm `conversation_id`), **sources**, các **chunk văn bản** từ generator LLM, rồi **text_finalize** — tức là *pseudo-stream* sau khi có luồng token từ LLM client, không phải SSE trực tiếp từ API nhà cung cấp theo từng token thuần.
+
+Thứ tự xử lý chính trong `rag_query` (khớp code hiện tại):
+
+1. **Hội thoại:** dùng lại `conversation_id` hoặc tạo mới; cuối luồng ghi user/assistant qua `conversation_repository`.
+2. **`analyze_query`:** `query_understanding` gọi `compute_intent_bundle` → `intent` (chính là `routing_intent`), `detector_intent`, `rag_flags`, filter/từ khóa, `commune_situation`, … Nếu bật classifier: `classify_user_utterance` + `merge_utterance_labels_into_analysis`.
+3. **Out of scope:** `detector_intent == nan` hoặc `intent == out_of_scope` → thông điệp cố định, **không** rewrite, không retrieval.
+4. **Miền pháp lý:** `get_domain_filter_values` + (khi có filter) `classify_query_domain` — log và truyền xuống retrieval.
+5. **Redis:** cache theo **câu gốc**; **không** cache nhánh `checklist_documents`, `document_drafting`, `document_summary`.
+6. **Sau cache miss:** `rewrite_query` (trừ draft/summary) → `extract_query_features` → `compute_strategy_scores` → `select_strategies`.
+7. **Cán bộ xã:** `resolve_use_commune_officer_pipeline` — nếu đúng → `_answer_commune_officer_query` (retrieval dùng `retrieval_query` đã rewrite), rồi cache/log/return.
+8. **`checklist_documents`:** `_answer_checklist_query` (hybrid + LLM, `retrieval_query` đã rewrite).
+9. **`document_drafting`:** `_answer_drafting_query` → `draft_tool`.
+10. **`document_summary`:** `document_summarizer.summarize_matched_document`.
+11. **RAG mặc định:**  
+    - Gợi ý multi-query: probe `vector_search` + `rag_flags` + `should_expand_query_v2` + strategy có `STRATEGY_MULTI_QUERY`.  
+    - `hybrid_search` rộng → tuỳ cờ gọi thêm `_multi_query_retrieve`, `dedup_chunks`, sắp theo `rerank_score` / `rrf_score`.  
+    - Nếu user trích dẫn số văn bản rõ: lọc passage khớp `_passages_match_explicit_doc_ref`.  
+    - **Neo chủ đề:** retry `hybrid_search` khi anchor chủ thể / từ khóa chủ đề không khớp ngữ cảnh (trừ khi có số hiệu rõ).  
+    - **Trống kết quả:** thử hybrid “nới” (bỏ domain) cho câu thủ tục hoặc có số văn bản.  
+    - Câu điều kiện đăng ký / phạm vi pháp lý rộng: `_fallback_full_article_retrieval`.  
+    - Ghép ngữ cảnh: một văn bản/điều vs `group_chunks_by_article` + `format_grouped_context`; câu chỉ hỏi “văn bản nào” có thể trả lời deterministik không qua LLM.
+12. **LLM:** `_build_rag_user_prompt` + `SYSTEM_PROMPT_V2`; có history thì `generate_with_messages` / `generate_with_messages_stream`, không thì `generate` / `generate_stream`.
+13. **Hậu xử lý:** `sanitize_rag_llm_output`, retry nếu model trả “không có thông tin” nhưng vẫn có passage; chỉnh riêng khi câu hỏi **mức phạt** nhưng ngữ cảnh là **thẩm quyền** (`query_asks_fine_amount` + `context_describes_authority`).
+14. **`validate_article_completeness`:** thiếu khoản trong Điều → retrieve full điều và regenerate.
+15. **Chống ảo:** so khớp Điều bắt buộc (khi câu hỏi yêu cầu), `strip_answer_lines_with_hallucinated_doc_numbers`, `_build_related_documents_fallback` khi cần.
+16. **`validate_answer` (LLM):** groundedness; fail → prompt nghiêm + regenerate hoặc `get_fallback_answer`.
+17. **`_ensure_legal_citations`**, guard bắt buộc có cặp Điều–nội dung cho một số intent pháp lý.
+18. **Độ tin cậy thấp:** có thể retry đường multi-article; vẫn thấp có thể gọi `_fallback_reasoning` từ `rag_chain`.
+19. **`_append_followup_prompts`**, ghi Redis, `log_interaction`, lưu turn hội thoại.
+
+```mermaid
+flowchart TD
+  HTTP[POST /api/chat hoặc /stream] --> CONV[conversation_id]
+  CONV --> AQ[analyze_query ± utterance merge]
+  AQ --> OOS{OOS / nan?}
+  OOS -->|có| END1[Thông báo ngoài phạm vi]
+  OOS -->|không| DOM[Domain filter]
+  DOM --> CACHE{Redis?}
+  CACHE -->|hit| OUT[Trả cache]
+  CACHE -->|miss| RW[rewrite + strategy]
+  RW --> COM{Cán bộ xã?}
+  COM -->|có| CO[commune officer RAG]
+  COM -->|không| BR{Nhánh intent}
+  BR -->|checklist| CL[checklist + hybrid]
+  BR -->|draft| DR[draft_tool]
+  BR -->|summary| SM[summarizer]
+  BR -->|mặc định| HY[hybrid ± multi_query]
+  HY --> CTX[Context + full-article fallback]
+  CTX --> LLM[LLM + validate + citations]
+  LLM --> FIN[cache + log + persist]
+  CO --> FIN
+  CL --> FIN
+  DR --> FIN
+  SM --> FIN
+```
+
+### 4. Lớp Copilot (`agents/copilot_agent`)
+
+Luồng **không** thay thế `analyze_query` trên `/api/chat`; Copilot gọi `detect_intent` (async: guard, PhoBERT nếu bật, prototype, YAML, có thể LLM), kiểm tra `is_in_document_domain`, rồi hoặc **`route_query`** (intent chuyên biệt: thủ tục, soạn thảo, trích xuất, …) hoặc **`rag_query_unified`** / stream — bên trong vẫn là `rag_chain_v2`.
+
+---
+
 ## Phiên bản schema & hành vi gần đây
 
 
@@ -92,7 +203,7 @@ flowchart TB
 | **Cờ RAG bổ sung (`query_intent`)**   | Sau `map_intent_to_rag_flags`: `_force_multi_article_for_comprehensive_statutory_queries` bật `needs_expansion` + `use_multi_article` cho *chính sách nhà nước*, *tiêu chí + phân loại/trọng điểm*, *thư viện công* + (là gì / điều kiện).                                                                                                                     |
 | `**routing.yaml`**                    | Nhóm `substantive_expansion` và `multi_article_boost_substantive` bổ sung pattern *chính sách… nhà nước*, *tiêu chí… phân loại/dự án*, *dự án trọng điểm quốc gia*.                                                                                                                                                                                            |
 | **Định dạng câu trả lời RAG**         | Không còn chèn tự động danh sách “Các văn bản pháp luật liên quan trong cơ sở dữ liệu hiện có”; `RAG_PROMPT_TEMPLATE_V2` / `RAG_PROMPT_TEMPLATE` hướng dẫn ghi văn bản trong **Căn cứ pháp lý** hoặc gắn với đoạn trích. Fallback “chỉ có tên văn bản” (`_build_related_documents_fallback`) vẫn dùng khi không có nội dung chi tiết.                          |
-| `**MULTI_ARTICLE_MAX_ARTICLES*`*      | Mặc định **8** (trước 5); chỉnh qua biến môi trường nếu cần.                                                                                                                                                                                                                                                                                                   |
+| `**MULTI_ARTICLE_MAX_ARTICLES`**      | Mặc định **8** (trước 5); chỉnh qua biến môi trường nếu cần.                                                                                                                                                                                                                                                                                                   |
 | **UX**                                | Căn cứ pháp lý gom theo văn bản; follow-up cuối câu theo ngưỡng độ tin cậy.                                                                                                                                                                                                                                                                                    |
 | **Lưu file**                          | Upload vào `backend/app/storage/<id>/` (thư mục **gitignore**).                                                                                                                                                                                                                                                                                                |
 
@@ -106,14 +217,17 @@ flowchart TB
 3. `warmup_commune_route_index()`
 4. `ensure_collection()` (Qdrant)
 5. `warmup_reranker()`
-6. `warmup_intent_index()` (prototype cosine cho intent)
-7. `warmup_intent_classifier()` (PhoBERT trong `app/intent_model`; bỏ qua an toàn nếu tắt hoặc thiếu `transformers`/weights)
-8. `warmup_domain_index()`
-9. Shutdown: `close_postgres()`
+6. `load_intent_pattern_config()` — nạp `intent_patterns/routing.yaml` (structural + routing + prototype)
+7. `warmup_intent_index()` (prototype cosine cho intent)
+8. `warmup_intent_classifier()` (PhoBERT trong `app/intent_model`; bỏ qua an toàn nếu tắt hoặc thiếu `transformers`/weights)
+9. `warmup_domain_index()`
+10. Shutdown: `close_postgres()`
 
 ---
 
 ## Luồng chat production: `POST /api/chat` & `/api/chat/stream`
+
+Bảng dưới là **bản tóm tắt**; mô tả từng bước và sơ đồ đầy đủ nằm ở [Pipeline hệ thống — phân tích chi tiết](#pipeline-hệ-thống--phân-tích-chi-tiết) (§3).
 
 **Router:** `app/routers/chat_router.py` → `**rag_query`** / `**rag_query_stream`**.
 
@@ -122,19 +236,18 @@ flowchart TB
 
 | Bước | Việc xảy ra                                                                                                                                                                                       |
 | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 0    | `conversation_id` (tạo mới nếu cần)                                                                                                                                                               |
-| 1    | Ninh Bình tool (`should_use_ninh_binh_tool` → `route_to_ninh_binh`) nếu khớp                                                                                                                      |
-| 2    | `analyze_query` → `intent` (= `routing_intent`), `rag_flags`, `commune_situation`; sau đó (nếu bật classifier) `merge_utterance_labels_into_analysis(..., query=)` — xem mục **Intent & cờ RAG**  |
-| 3    | **Out of scope:** `detector_intent == nan` hoặc `intent == out_of_scope` → trả lời cố định, **không** gọi rewrite                                                                                 |
-| 4    | Lọc miền pháp lý: `get_domain_filter_values` + `classify_query_domain`                                                                                                                            |
-| 5    | Redis cache theo **câu gốc** (bỏ qua checklist / draft / summary)                                                                                                                                 |
-| 6    | **Sau cache miss:** `rewrite_query` (LLM, trừ draft/summary) → `extract_query_features` + `compute_strategy_scores` + `select_strategies` (log `rewritten_query`, strategies)                     |
-| 7    | `**resolve_use_commune_officer_pipeline`** → `_answer_commune_officer_query(..., retrieval_query=rewritten)` nếu true                                                                             |
-| 8    | `checklist_documents` / `document_drafting` / `document_summary` (checklist: `hybrid_search` dùng `retrieval_query` đã rewrite)                                                                   |
-| 9    | `_multi_query_retrieve` **hoặc** `_parallel_retrieve_all` **hoặc** `hybrid_search` — truy vấn retrieval = `rewritten_query`; cộng hưởng `rag_flags` + `STRATEGY_MULTI_QUERY` trong top-2          |
-| 10   | **Neo chủ đề / overlap:** anchor + retry retrieval; `**_fallback_full_article_retrieval`** khi khớp điều kiện đăng ký / chính sách… (xem `query_text_patterns.py`)                                |
-| 11   | Ghép context; LLM `_build_rag_user_prompt` + `SYSTEM_PROMPT_V2` (prompt vẫn theo **câu gốc** `query`)                                                                                             |
-| 12   | Hậu xử lý: `validate_article_completeness`, strip số hiệu ảo; `**validate_answer`** (LLM, nếu có `OPENAI_API_KEY`) — fail → regenerate strict hoặc fallback; `_ensure_legal_citations`, follow-up |
+| 0    | `conversation_id` (tái sử dụng hoặc tạo mới); lưu turn qua `conversation_repository`                                                                                                               |
+| 1    | `analyze_query` → `intent` (= `routing_intent`), `rag_flags`, `commune_situation`; (tuỳ cấu hình) `merge_utterance_labels_into_analysis` — xem **Intent & cờ RAG** và mục **Pipeline chi tiết §3** |
+| 2    | **Out of scope:** `detector_intent == nan` hoặc `intent == out_of_scope` → thông điệp cố định, **không** rewrite / retrieval                                                                        |
+| 3    | Lọc miền pháp lý: `get_domain_filter_values` + `classify_query_domain` (khi có filter)                                                                                                             |
+| 4    | Redis cache theo **câu gốc** (bỏ qua checklist / draft / summary)                                                                                                                                  |
+| 5    | **Sau cache miss:** `rewrite_query` (LLM, trừ draft/summary) → `extract_query_features` + `compute_strategy_scores` + `select_strategies`                                                         |
+| 6    | `resolve_use_commune_officer_pipeline` → `_answer_commune_officer_query(..., retrieval_query=rewritten)` nếu true                                                                               |
+| 7    | `checklist_documents` / `document_drafting` / `document_summary` (checklist dùng `retrieval_query` đã rewrite)                                                                                     |
+| 8    | Nhánh RAG mặc định: `hybrid_search` broad ± `_multi_query_retrieve` (cộng hưởng `rag_flags`, `should_expand_query_v2`, `STRATEGY_MULTI_QUERY`); dedup/sort; lọc số văn bản nếu user trích dẫn rõ     |
+| 9    | **Neo chủ đề:** retry `hybrid_search` khi anchor/topic lệch; `_fallback_full_article_retrieval` cho điều kiện đăng ký / phạm vi pháp lý rộng (xem `query_text_patterns.py`)                       |
+| 10   | Ghép context (một điều/văn bản hoặc `group_chunks_by_article`); LLM `_build_rag_user_prompt` + `SYSTEM_PROMPT_V2` (user message vẫn dùng **câu gốc** `query`)                                      |
+| 11   | Hậu xử lý: sanitize, retry no-info, chỉnh mức phạt vs thẩm quyền; `validate_article_completeness`; chống ảo số hiệu/Điều; `validate_answer` (LLM) nếu có key; `_ensure_legal_citations`; retry độ tin cậy / `_fallback_reasoning`; follow-up |
 
 
 **Ghi chú Copilot / `query_router`:** nhánh `_handle_commune_level` cũng gọi `rewrite_query` rồi truyền `retrieval_query` vào `_answer_commune_officer_query` để đồng bộ với chat chính.
@@ -163,11 +276,13 @@ Mặc định `INTENT_MODEL_ENABLED=false` (rule-based + prototype, không PhoBE
 
 ### Lịch sử cải tiến qua 3 phiên bản
 
-| Phiên bản | Thay đổi | Relaxed match | Micro acc | Weighted F1 |
-|---|---|:---:|:---:|:---:|
-| **v1** (ban đầu) | Pipeline gốc | 43% | 43.9% | 0.380 |
-| **v2** | `query_features` delegate → `query_text_patterns`; `domain_guard` frozenset | 43% | 43.9% | 0.380 |
-| **v3** (hiện tại) | Fix 3 pattern YAML + normalize gold aliases trong EDA | **56%** | **57.1%** | **0.545** |
+
+| Phiên bản         | Thay đổi                                                                    | Relaxed match | Micro acc | Weighted F1 |
+| ----------------- | --------------------------------------------------------------------------- | ------------- | --------- | ----------- |
+| **v1** (ban đầu)  | Pipeline gốc                                                                | 43%           | 43.9%     | 0.380       |
+| **v2**            | `query_features` delegate → `query_text_patterns`; `domain_guard` frozenset | 43%           | 43.9%     | 0.380       |
+| **v3** (hiện tại) | Fix 3 pattern YAML + normalize gold aliases trong EDA                       | **56%**       | **57.1%** | **0.545**   |
+
 
 > **Lưu ý v1→v2:** chỉ thấy cải thiện feature counts, strategy distribution; score không đổi vì không sửa YAML.  
 > **Lưu ý v2→v3:** bước nhảy lớn (+13pp acc, +0.165 weighted F1) nhờ sửa 3 intent pattern và điều chỉnh EDA normalize gold label qua `LEGACY_INTENT_ALIASES` (gold `thu_tuc_hanh_chinh`→`huong_dan_thu_tuc`, `bao_ton_phat_trien`→`giai_thich_quy_dinh`).
@@ -176,40 +291,44 @@ Mặc định `INTENT_MODEL_ENABLED=false` (rule-based + prototype, không PhoBE
 
 ### Kết quả v3 — tổng quan (n=100, seed=42)
 
-| Khía cạnh | Quan sát |
-|---|---|
-| **Gold vs detector (khớp mềm + alias)** | 56/100 (**56%**), tăng từ 43% nhờ alias normalize + pattern mới. |
-| **Micro accuracy (strict)** | **57.1%** (56 TP / 98 câu có nhãn), tăng +13pp so với v2. |
-| **Macro F1** | **0.414** (+0.164 so với v2 = 0.250). |
-| **Weighted F1** | **0.545** (+0.165 so với v2 = 0.380). |
-| **Routing** | `legal_lookup` 36%; `hoi_dap_chung` 24%; `giai_thich_quy_dinh` 11%; `huong_dan_thu_tuc` 11%; `xu_ly_vi_pham_hanh_chinh` 5% (mới). |
-| **Detector confidence** | mean **~0.78** (+0.06); median **0.925**; `>=0.90`: **63%** (+11pp); `<0.35`: **24%** (-10pp). |
-| **Strategy** | không thay đổi so v2: `multi_query+semantic` 29%; `semantic` 31%; lookup 24 lần. |
+
+| Khía cạnh                               | Quan sát                                                                                                                          |
+| --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| **Gold vs detector (khớp mềm + alias)** | 56/100 (**56%**), tăng từ 43% nhờ alias normalize + pattern mới.                                                                  |
+| **Micro accuracy (strict)**             | **57.1%** (56 TP / 98 câu có nhãn), tăng +13pp so với v2.                                                                         |
+| **Macro F1**                            | **0.414** (+0.164 so với v2 = 0.250).                                                                                             |
+| **Weighted F1**                         | **0.545** (+0.165 so với v2 = 0.380).                                                                                             |
+| **Routing**                             | `legal_lookup` 36%; `hoi_dap_chung` 24%; `giai_thich_quy_dinh` 11%; `huong_dan_thu_tuc` 11%; `xu_ly_vi_pham_hanh_chinh` 5% (mới). |
+| **Detector confidence**                 | mean **~0.78** (+0.06); median **0.925**; `>=0.90`: **63%** (+11pp); `<0.35`: **24%** (-10pp).                                    |
+| **Strategy**                            | không thay đổi so v2: `multi_query+semantic` 29%; `semantic` 31%; lookup 24 lần.                                                  |
+
 
 ---
 
 ### Per-class Intent Metrics — v3 (strict match, gold normalized, 98 câu)
 
-| intent | support | predicted | TP | precision | recall | F1 | vs v2 |
-|---|---:|---:|---:|---:|---:|---:|:---:|
-| `giai_thich_quy_dinh` | 20 | 11 | 7 | 0.636 | 0.350 | 0.452 | +0.008 |
-| `article_query` | 16 | 25 | 16 | 0.640 | **1.000** | **0.780** | = |
-| `hoi_dap_chung` | 12 | 22 | 9 | 0.409 | 0.750 | 0.529 | +0.120 |
-| `huong_dan_thu_tuc` | **12** | 11 | 7 | 0.636 | 0.583 | **0.609** | +0.466 ↑↑ |
-| `tra_cuu_van_ban` | 11 | 13 | 5 | 0.385 | 0.455 | 0.417 | +0.017 |
-| `xu_ly_vi_pham_hanh_chinh` | 5 | 5 | 4 | **0.800** | **0.800** | **0.800** | +0.800 ↑↑↑ |
-| `soan_thao_van_ban` | 4 | 2 | 2 | **1.000** | 0.500 | 0.667 | = |
-| `so_sanh_van_ban` | 3 | 2 | 1 | 0.500 | 0.333 | 0.400 | = |
-| `tom_tat_van_ban` | 3 | 2 | 2 | **1.000** | 0.667 | **0.800** | +0.800 ↑↑↑ |
-| `hoa_giai_van_dong` | 2 | 1 | 1 | **1.000** | 0.500 | 0.667 | = |
-| `tao_bao_cao` | 2 | 1 | 0 | 0.000 | 0.000 | 0.000 | = |
-| `trich_xuat_van_ban` | 2 | 1 | 1 | **1.000** | 0.500 | 0.667 | = |
-| `to_chuc_su_kien_cong` | 1 | 2 | 1 | 0.500 | **1.000** | 0.667 | = |
-| `admin_planning` | 1 | 0 | 0 | 0.000 | 0.000 | 0.000 | = |
-| `can_cu_phap_ly` | 1 | 0 | 0 | 0.000 | 0.000 | 0.000 | = |
-| `document_meta_relation` | 1 | 0 | 0 | 0.000 | 0.000 | 0.000 | = |
-| `kiem_tra_ho_so` | 1 | 0 | 0 | 0.000 | 0.000 | 0.000 | = |
-| `kiem_tra_thanh_tra` | 1 | 0 | 0 | 0.000 | 0.000 | 0.000 | = |
+
+| intent                     | support | predicted | TP  | precision | recall    | F1        | vs v2      |
+| -------------------------- | ------- | --------- | --- | --------- | --------- | --------- | ---------- |
+| `giai_thich_quy_dinh`      | 20      | 11        | 7   | 0.636     | 0.350     | 0.452     | +0.008     |
+| `article_query`            | 16      | 25        | 16  | 0.640     | **1.000** | **0.780** | =          |
+| `hoi_dap_chung`            | 12      | 22        | 9   | 0.409     | 0.750     | 0.529     | +0.120     |
+| `huong_dan_thu_tuc`        | **12**  | 11        | 7   | 0.636     | 0.583     | **0.609** | +0.466 ↑↑  |
+| `tra_cuu_van_ban`          | 11      | 13        | 5   | 0.385     | 0.455     | 0.417     | +0.017     |
+| `xu_ly_vi_pham_hanh_chinh` | 5       | 5         | 4   | **0.800** | **0.800** | **0.800** | +0.800 ↑↑↑ |
+| `soan_thao_van_ban`        | 4       | 2         | 2   | **1.000** | 0.500     | 0.667     | =          |
+| `so_sanh_van_ban`          | 3       | 2         | 1   | 0.500     | 0.333     | 0.400     | =          |
+| `tom_tat_van_ban`          | 3       | 2         | 2   | **1.000** | 0.667     | **0.800** | +0.800 ↑↑↑ |
+| `hoa_giai_van_dong`        | 2       | 1         | 1   | **1.000** | 0.500     | 0.667     | =          |
+| `tao_bao_cao`              | 2       | 1         | 0   | 0.000     | 0.000     | 0.000     | =          |
+| `trich_xuat_van_ban`       | 2       | 1         | 1   | **1.000** | 0.500     | 0.667     | =          |
+| `to_chuc_su_kien_cong`     | 1       | 2         | 1   | 0.500     | **1.000** | 0.667     | =          |
+| `admin_planning`           | 1       | 0         | 0   | 0.000     | 0.000     | 0.000     | =          |
+| `can_cu_phap_ly`           | 1       | 0         | 0   | 0.000     | 0.000     | 0.000     | =          |
+| `document_meta_relation`   | 1       | 0         | 0   | 0.000     | 0.000     | 0.000     | =          |
+| `kiem_tra_ho_so`           | 1       | 0         | 0   | 0.000     | 0.000     | 0.000     | =          |
+| `kiem_tra_thanh_tra`       | 1       | 0         | 0   | 0.000     | 0.000     | 0.000     | =          |
+
 
 **Micro**: precision `0.571` | recall `0.571` | accuracy `0.571` | F1 `0.571`  
 **Macro**: precision `0.473` | recall `0.413` | F1 `0.414`  
@@ -220,34 +339,37 @@ Mặc định `INTENT_MODEL_ENABLED=false` (rule-based + prototype, không PhoBE
 ### Phân tích intent — cải thiện nổi bật (v3)
 
 **Cải thiện đột biến:**
+
 - `xu_ly_vi_pham_hanh_chinh` F1 **0.000 → 0.800**: thêm pattern `bị xử phạt thế nào` / `hành vi...bị xử`
 - `tom_tat_van_ban` F1 **0.000 → 0.800**: mở rộng pattern — `tóm tắt nội dung/quy định` + looser anchor
 - `huong_dan_thu_tuc` F1 **0.143 → 0.609**: thêm `trình tự thủ tục`, `thủ tục thành lập`, `quy trình đề nghị`; support tăng 8→12 sau alias normalization
 
 **Vẫn cần cải thiện (F1 = 0):**
+
 - `tao_bao_cao`: "Mẫu báo cáo..." bị góm về `huong_dan_thu_tuc`; cần tách pattern “mẫu báo cáo”
 - `admin_planning`, `can_cu_phap_ly`, `document_meta_relation` — support=1, không thể đánh giá đáng tin cậy trên 100 câu
 
 **Remaining hard cases (v3):**
+
 - `xu_ly_vi_pham_hanh_chinh` miss duy nhất: câu “áp dụng cho vi phạm nào” → `giai_thich_quy_dinh` (hợp lý về mặt routing)
 - `huong_dan_thu_tuc` 3 miss còn lại: có “Điều X” trong câu → `article_query` thắng ưu tiên (correct về retrieval)
 - `giai_thich_quy_dinh` recall 0.35: một số câu có số NĐ → `tra_cuu_van_ban`; overlap taxonomy khó giải quyết bằng rule
 
 **So sánh với EDA toàn bộ 5744 câu (`test_intent_ragflags_datajson.py`):**
 
-| Intent | F1 (5744 câu) | F1 (100 câu v3) | Δ |
-|---|:---:|:---:|:---:|
-| `article_query` | 64.25% | **78%** | ↑ |
-| `giai_thich_quy_dinh` | 39.32% | 45.2% | ↑ |
-| `hoi_dap_chung` | 24.48% | 52.9% | ↑ (alias giảm false positive) |
-| `tra_cuu_van_ban` | 44.33% | 41.7% | ≈ |
-| `huong_dan_thu_tuc` | 17.14% | **60.9%** | ↑↑↑ |
-| `xu_ly_vi_pham_hanh_chinh` | 13.67% | **80%** | ↑↑↑ |
-| `tom_tat_van_ban` | 3.49% | **80%** | ↑↑↑ |
+
+| Intent                     | F1 (5744 câu) | F1 (100 câu v3) | Δ                             |
+| -------------------------- | ------------- | --------------- | ----------------------------- |
+| `article_query`            | 64.25%        | **78%**         | ↑                             |
+| `giai_thich_quy_dinh`      | 39.32%        | 45.2%           | ↑                             |
+| `hoi_dap_chung`            | 24.48%        | 52.9%           | ↑ (alias giảm false positive) |
+| `tra_cuu_van_ban`          | 44.33%        | 41.7%           | ≈                             |
+| `huong_dan_thu_tuc`        | 17.14%        | **60.9%**       | ↑↑↑                           |
+| `xu_ly_vi_pham_hanh_chinh` | 13.67%        | **80%**         | ↑↑↑                           |
+| `tom_tat_van_ban`          | 3.49%         | **80%**         | ↑↑↑                           |
+
 
 **Test pytest liên quan:** `tests/test_pipeline_v2_unit.py`, `tests/test_intent_routing_bundle_v2.py`; e2e API tùy chọn `tests/test_rag_v2_e2e_optional.py` (`RUN_E2E_API=1`).
-
-
 
 ---
 
@@ -301,38 +423,13 @@ Buckets confidence (detector):
 
 ### Sơ đồ nhánh (production)
 
-```mermaid
-flowchart TD
-  RQ[rag_query] --> NB{Ninh Bình?}
-  NB -->|có| E1[Kết thúc sớm]
-  NB -->|không| AQ[analyze_query + bundle]
-  AQ --> OOS{Out of scope?}
-  OOS -->|có| E2[Thông báo OOS]
-  OOS -->|không| DOM[Domain + Redis cache]
-  DOM --> MISS{Cache miss?}
-  MISS -->|không| OUT[Trả lời + follow-up]
-  MISS -->|có| RW[rewrite_query + strategy scores]
-  RW --> CA{Commune pipeline?}
-  CA -->|true| CO[Cán bộ xã: RAG + LLM + citations]
-  CA -->|false| SP{routing_intent}
-  SP -->|checklist| CL[Checklist: hybrid + LLM]
-  SP -->|draft/summary| DS[Draft tool / summarizer]
-  SP -->|khác| HY[Parallel / multi-query / hybrid]
-  HY --> LLM[LLM V2 + strip ảo / completeness]
-  LLM --> VAL["validate_answer (LLM)"]
-  VAL --> OUT
-  CO --> OUT
-  CL --> OUT
-  DS --> OUT
-```
+Sơ đồ **đầy đủ** và **thứ tự bước** nằm ở mục [Pipeline hệ thống — phân tích chi tiết](#pipeline-hệ-thống--phân-tích-chi-tiết) (mục **§3**). `rag_query` **không** còn nhánh thoát sớm theo tỉnh/Ninh Bình; dữ liệu địa phương (nếu có) nằm ở service/tool riêng, không chặn `analyze_query`.
 
-
-
-*Nhánh mặc định (sau `HY`) mới qua `validate_answer`; commune / checklist / draft không gọi validator LLM này trong `rag_chain_v2` hiện tại.*
+*Nhánh RAG mặc định (sau hybrid retrieval) thường qua `validate_answer` khi có ngữ cảnh và API key; các nhánh commune / checklist / draft / summary có tập bước hậu xử lý riêng trong `rag_chain_v2`.*
 
 ### Endpoint `/api/copilot/chat`
 
-Điều phối đầu: `detect_intent` (async) → `**route_query*`* (intent chuyên biệt) hoặc `**rag_query_unified**` → `**rag_chain_v2**`. Frontend màn chat chính dùng `**/api/chat/stream**`, không bắt buộc Copilot.
+Điều phối đầu: `detect_intent` (async) → `**route_query`** (intent chuyên biệt) hoặc `**rag_query_unified*`* → `**rag_chain_v2**`. Frontend màn chat chính dùng `**/api/chat/stream**`, không bắt buộc Copilot.
 
 ---
 
@@ -389,7 +486,7 @@ flowchart TB
 
 ### Vị trí trong pipeline (`rag_query`)
 
-Trong `rag_chain_v2.rag_query`, **Ninh Bình** (`should_use_ninh_binh_tool`) được xử lý **trước** `analyze_query` (thoát sớm nếu khớp). Đoạn sau chỉ mô tả **tầng intent** sau khi qua Ninh Bình.
+Trong `rag_chain_v2.rag_query`, **`analyze_query` là bước đầu** sau khi gắn `conversation_id`. Không còn tiền xử lý thoát sớm kiểu công cụ địa danh trước `analyze_query`.
 
 ```mermaid
 flowchart LR
@@ -695,6 +792,79 @@ Thư mục: `backend/tests/`, `tests/evaluation/` (tuỳ cấu hình Makefile).
 
 ---
 
+## Đánh giá offline — `data.json` (intent + cờ RAG)
+
+Bộ `**data.json**` ở thư mục gốc repo gồm **3510** mẫu dạng `{ "input", "output": { "intent", "rag_flags" } }` với **8 nhóm intent** (chuẩn `VALID_INTENTS`) và **3 cờ RAG runtime**: `needs_expansion`, `use_multi_article`, `is_legal_lookup`.
+
+**File kiểm thử:** `[backend/tests/test_data_json_intent_rag_pipeline_eval.py](backend/tests/test_data_json_intent_rag_pipeline_eval.py)` — gọi `compute_intent_bundle` (cùng nguồn với `analyze_query` / `query_intent`), chuẩn hoá intent dự đoán bằng `normalize_legacy_intent` rồi so với gold; tính **EDA** (phân phối nhãn, tỷ lệ cờ, độ dài câu) và **độ chính xác / F1 / confusion**.
+
+### Chạy
+
+```bash
+cd backend
+python tests/test_data_json_intent_rag_pipeline_eval.py
+# Giới hạn số mẫu (nhanh):
+set DATA_JSON_EVAL_LIMIT=500
+python tests/test_data_json_intent_rag_pipeline_eval.py
+pytest tests/test_data_json_intent_rag_pipeline_eval.py -q
+```
+
+**Kết quả:** `[backend/tests/evaluation/results/data_json_pipeline_eval.json](backend/tests/evaluation/results/data_json_pipeline_eval.json)` và `[data_json_pipeline_eval.md](backend/tests/evaluation/results/data_json_pipeline_eval.md)`.
+
+### EDA — phân phối nhãn gold (dataset)
+
+
+| Intent (gold)       | Số mẫu |
+| ------------------- | ------ |
+| comparison          | 634    |
+| admin_scenario      | 543    |
+| procedure           | 485    |
+| legal_lookup        | 409    |
+| document_generation | 401    |
+| summarization       | 365    |
+| violation           | 337    |
+| legal_explanation   | 336    |
+
+
+
+| Cờ (gold)         | Tỷ lệ mẫu = true |
+| ----------------- | ---------------- |
+| needs_expansion   | 72.0%            |
+| use_multi_article | 26.5%            |
+| is_legal_lookup   | 27.3%            |
+| is_scenario       | 13.2%            |
+
+
+Độ dài `input` (ký tự): khoảng **27–379**, trung bình ~**155**, trung vị **153**, p90 ~**230**.
+
+### Chỉ số pipeline (đối chiếu `compute_intent_bundle` với gold trong file)
+
+Số liệu dưới đây lấy từ một lần chạy đầy đủ 3510 mẫu trên cùng codebase; chạy lại script để cập nhật sau khi đổi rule/model.
+
+
+| Chỉ số                                  | Giá trị |
+| --------------------------------------- | ------- |
+| Detector accuracy (intent đã normalize) | 21.77%  |
+| Routing accuracy (`routing_intent`)     | 21.51%  |
+| Khớp cả 3 cờ RAG                        | 25.93%  |
+| Macro F1 (detector)                     | 19.12%  |
+| Weighted F1 (detector)                  | 18.52%  |
+
+
+
+| Cờ                 | Accuracy từng trường |
+| ------------------ | -------------------- |
+| needs_expansion    | 71.00%               |
+| use_multi_article7 | 41.31%               |
+| is_legal_lookup    | 71.99%               |
+
+
+**Quan sát nhanh:** detector gán `**legal_explanation`** cho một phần lớn câu khi độ tin cậy thấp (fallback prototype / semantic), dẫn tới nhầm với gold `**comparison**`, `**admin_scenario**`, `**document_generation**`, v.v.; câu có **số NĐ / Điều** dễ bị gán `**legal_lookup`** thay cho `procedure` / `summarization`. Cài `**PyYAML**` đầy đủ để bật structural rules trong `routing.yaml`; bật `**INTENT_MODEL_ENABLED**` khi cần sát môi trường production (PhoBERT). Từ bản này, hệ thống chuẩn hoá về **3 cờ runtime** (không dùng `is_scenario` trong `rag_flags`).
+
+**File liên quan (mẫu nhỏ / gold khác):** `[backend/tests/test_data_clean_intent_eval.py](backend/tests/test_data_clean_intent_eval.py)` trên `data_clean.json`; bảng lịch sử đánh giá trên tập lớn nhãn **legacy** (18 lớp) nằm ở mục *EDA Intent + RAG Flags (lịch sử / legacy)* bên dưới.
+
+---
+
 ## Đánh giá toàn diện (retrieval, E2E, A/B `query_route_classifier`)
 
 Ngoài EDA intent + RAG flags, repo có thêm bộ đánh giá để tách bottleneck **retrieval** vs **generation** và đo tác động lớp **LLM JSON** (`QUERY_UTTERANCE_CLASSIFIER_ENABLED` / `query_route_classifier`).
@@ -754,15 +924,11 @@ python -m pytest tests/evaluation/test_eval_comprehensive.py -q
 
 ---
 
-## EDA Intent + RAG Flags (data_clean.json)
+## EDA Intent + RAG Flags (lịch sử / legacy — nhãn 18 lớp cũ)
 
-Đã chạy evaluator trên `data_clean.json` bằng test:
+Bảng dưới là **tham chiếu lịch sử** khi gold dùng taxonomy fine-grained (ví dụ `article_query`, `tra_cuu_van_ban`, …) trên tập lớn; **đánh giá nhóm 8 intent + `data.json` hiện tại** dùng mục [Đánh giá offline — `data.json](#đánh-giá-offline--datajson-intent--cờ-rag)` và file `test_data_json_intent_rag_pipeline_eval.py`.
 
-`backend/tests/evaluation/test_intent_ragflags_datajson.py`
-
-Ghi chú run này: đặt `INTENT_MODEL_ENABLED=false` để đánh giá trực tiếp hiệu quả rule/pattern sau khi cập nhật intent.
-
-Kết quả (latest run, sau khi cập nhật lại rule cho từng intent):
+Kết quả đã lưu (một lần chạy cũ, `INTENT_MODEL_ENABLED=false`):
 
 - Samples: **5744**
 - Detector intent accuracy: **39.62%**
@@ -770,66 +936,9 @@ Kết quả (latest run, sau khi cập nhật lại rule cho từng intent):
 - RAG flags exact-match accuracy: **45.37%**
 - Detector macro F1: **35.49%**
 
-RAG flag accuracy:
+RAG flag accuracy (từng trường): `is_legal_lookup` 89.17%; `needs_expansion` 53.12%; `use_multi_article` 88.37%; `is_scenario` 72.68%.
 
-
-| Flag                | Accuracy |
-| ------------------- | -------- |
-| `is_legal_lookup`   | 89.17%   |
-| `needs_expansion`   | 53.12%   |
-| `use_multi_article` | 88.37%   |
-| `is_scenario`       | 72.68%   |
-
-
-Chi tiết theo intent:
-
-
-| Intent                     | Support | Predicted | Precision | Recall | F1     |
-| -------------------------- | ------- | --------- | --------- | ------ | ------ |
-| `tra_cuu_van_ban`          | 675     | 534       | 50.19%    | 39.70% | 44.33% |
-| `huong_dan_thu_tuc`        | 634     | 101       | 62.38%    | 9.94%  | 17.14% |
-| `article_query`            | 632     | 1323      | 47.47%    | 99.37% | 64.25% |
-| `giai_thich_quy_dinh`      | 505     | 324       | 50.31%    | 32.28% | 39.32% |
-| `hoi_dap_chung`            | 400     | 1250      | 16.16%    | 50.50% | 24.48% |
-| `xu_ly_vi_pham_hanh_chinh` | 312     | 127       | 23.62%    | 9.62%  | 13.67% |
-| `trich_xuat_van_ban`       | 270     | 157       | 99.36%    | 57.78% | 73.07% |
-| `so_sanh_van_ban`          | 228     | 139       | 66.91%    | 40.79% | 50.68% |
-| `tom_tat_van_ban`          | 225     | 4         | 100.00%   | 1.78%  | 3.49%  |
-| `document_relation`        | 218     | 156       | 57.05%    | 40.83% | 47.59% |
-| `bao_ton_phat_trien`       | 194     | 933       | 15.54%    | 74.74% | 25.73% |
-| `to_chuc_su_kien_cong`     | 167     | 87        | 37.93%    | 19.76% | 25.98% |
-| `soan_thao_van_ban`        | 160     | 99        | 89.90%    | 55.62% | 68.73% |
-| `document_metadata`        | 157     | 9         | 100.00%   | 5.73%  | 10.84% |
-| `tao_bao_cao`              | 132     | 113       | 82.30%    | 70.45% | 75.92% |
-| `kiem_tra_thanh_tra`       | 130     | 56        | 87.50%    | 37.69% | 52.69% |
-| `thu_tuc_hanh_chinh`       | 118     | 13        | 0.00%     | 0.00%  | 0.00%  |
-| `hoa_giai_van_dong`        | 113     | 27        | 96.30%    | 23.01% | 37.14% |
-| `can_cu_phap_ly`           | 101     | 51        | 96.08%    | 48.51% | 64.47% |
-| `bao_ve_xa_hoi`            | 100     | 169       | 18.34%    | 31.00% | 23.05% |
-| `kiem_tra_ho_so`           | 79      | 11        | 100.00%   | 13.92% | 24.44% |
-| `program_goal`             | 78      | 61        | 73.77%    | 57.69% | 64.75% |
-| `admin_planning`           | 70      | 0         | 0.00%     | 0.00%  | 0.00%  |
-
-
-Top confusion chính:
-
-- `huong_dan_thu_tuc` -> `hoi_dap_chung`: 305
-- `tra_cuu_van_ban` -> `article_query`: 154
-- `trich_xuat_van_ban` -> `article_query`: 114
-- `xu_ly_vi_pham_hanh_chinh` -> `bao_ton_phat_trien`: 98
-- `giai_thich_quy_dinh` -> `hoi_dap_chung`: 90
-
-Artifacts chi tiết:
-
-- `backend/tests/evaluation/results/intent_ragflags_eda_data_clean.md`
-- `backend/tests/evaluation/results/intent_ragflags_eda_data_clean.json`
-
-Lệnh chạy lại:
-
-```bash
-cd rag_chatbot
-backend\venv\Scripts\python.exe -m pytest backend/tests/evaluation/test_intent_ragflags_datajson.py -q
-```
+Artifacts: `backend/tests/evaluation/results/intent_ragflags_eda_data_clean.md` và `.json`. Script legacy: `backend/tests/evaluation/test_intent_ragflags_datajson.py` (cần đúng định dạng dữ liệu đầu vào).
 
 ---
 

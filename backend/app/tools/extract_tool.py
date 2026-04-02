@@ -13,7 +13,8 @@ from app.services.retrieval import search_all, format_sources
 
 EXTRACT_SYSTEM = (
     "Bạn là chuyên gia phân tích văn bản pháp luật Việt Nam. "
-    "Hãy trích xuất các thông tin quan trọng một cách chính xác."
+    "Hãy trích xuất các thông tin quan trọng một cách chính xác. "
+    "Khi nêu Điều/Khoản phải nêu rõ nội dung quy định tương ứng từ ngữ cảnh."
 )
 
 EXTRACT_PROMPT = """Hãy trích xuất các thông tin quan trọng từ văn bản sau:
@@ -27,10 +28,14 @@ Thông tin cần trích xuất:
 3. **Cơ quan ban hành**: (nếu có)
 4. **Loại văn bản**: (Luật / Nghị định / Thông tư / ...)
 5. **Lĩnh vực**: (nếu xác định được)
-6. **Các điều khoản chính**: Liệt kê
+6. **Các điều khoản chính**: Liệt kê Điều/Khoản và nội dung chính của từng điều khoản
 7. **Đối tượng áp dụng**: (nếu có)
 8. **Hiệu lực thi hành**: (nếu có)
 9. **Các từ khóa quan trọng**: Liệt kê
+
+YÊU CẦU BẮT BUỘC:
+- Không chỉ liệt kê số điều; phải nêu nội dung mỗi điều khoản chính.
+- Không bịa đặt nội dung ngoài văn bản được cung cấp.
 """
 
 

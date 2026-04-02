@@ -162,7 +162,6 @@ def merge_utterance_labels_into_analysis(
     ):
         out["intent"] = "out_of_scope"
         out["rag_flags"] = {
-            "is_scenario": False,
             "is_legal_lookup": False,
             "use_multi_article": False,
             "needs_expansion": False,

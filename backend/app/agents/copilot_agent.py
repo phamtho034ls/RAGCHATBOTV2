@@ -32,6 +32,15 @@ from app.services.rag_unified import rag_query_unified, rag_query_stream_unified
 
 # Intent cần routing chuyên biệt (không dùng RAG thuần)
 SPECIALIZED_INTENTS = {
+    # 8 nhóm intent (multitask PhoBERT / normalize_legacy_intent)
+    "legal_explanation",
+    "procedure",
+    "violation",
+    "admin_scenario",
+    "comparison",
+    "summarization",
+    "document_generation",
+    # Fine-grained legacy (LLM / semantic / YAML trước khi gộp)
     "tao_bao_cao", "soan_thao_van_ban", "tom_tat_van_ban",
     "so_sanh_van_ban", "kiem_tra_ho_so", "huong_dan_thu_tuc",
     "trich_xuat_van_ban", "can_cu_phap_ly", "giai_thich_quy_dinh",
@@ -55,17 +64,6 @@ CONTEXT_REFERENCE_PATTERNS = [
 ]
 
 log = logging.getLogger(__name__)
-
-# Ninh Bình tool: dùng shared router (keywords bao gồm huyện Yên Mô, Yên Khánh, ...)
-from app.services.ninh_binh_router import should_use_ninh_binh_tool as _should_use_ninh_binh_tool
-from app.services.ninh_binh_web_search import search_wikipedia, _is_wikipedia_insufficient
-
-
-LEGAL_WEB_BLOCK_PATTERN = re.compile(
-    r"\bluật\b|\bnghị\s*định\b|\bthông\s*tư\b|\bđiều\b|\bkhoản\b|\bpháp\s+luật\b",
-    re.IGNORECASE,
-)
-
 
 def _is_context_reference_regex(question: str) -> bool:
     """Fallback regex: tham chiếu ngữ cảnh hội thoại."""
@@ -138,36 +136,6 @@ def _extract_document_metadata_from_answer(answer: str, question: str) -> Option
     return extract_document_metadata(question)
 
 
-def _is_legal_question_regex(question: str) -> bool:
-    """Fallback: từ khóa pháp lý — không đưa sang web tổng quát."""
-    return bool(LEGAL_WEB_BLOCK_PATTERN.search((question or "").strip()))
-
-
-def _is_legal_question(question: str, labels: Optional[UtteranceLabels]) -> bool:
-    if labels is not None:
-        return bool(labels.is_legal_or_admin_query)
-    return _is_legal_question_regex(question)
-
-
-async def _run_hybrid_general_search(question: str) -> Dict[str, Any]:
-    """Wikipedia first, then OpenAI web search fallback."""
-    wiki_result = await search_wikipedia(question)
-    if not _is_wikipedia_insufficient(wiki_result):
-        return {
-            "answer": wiki_result.get("answer", ""),
-            "sources": wiki_result.get("sources", []),
-            "pipeline": "wikipedia",
-        }
-
-    from app.tools.openai_web_search_tool import run as openai_web_search_run
-    web_result = await openai_web_search_run(question)
-    return {
-        "answer": web_result.get("answer", ""),
-        "sources": web_result.get("sources", []),
-        "pipeline": "openai_web_search",
-    }
-
-
 async def process(
     question: str,
     temperature: float = 0.5,
@@ -201,28 +169,6 @@ async def process(
     log.info("[LOG] intent=%s, confidence=%.2f, question=%s",
              intent, confidence, question[:80])
 
-    is_legal = _is_legal_question(question, utterance_labels)
-    is_specialized = intent in SPECIALIZED_INTENTS and confidence >= 0.5
-
-    # 2b. Hybrid web search (general, non-legal only): Wikipedia -> OpenAI web fallback
-    # Skip web search if intent is specialized (admin_planning needs multi-step pipeline)
-    if not is_legal and _should_use_ninh_binh_tool(question) and not is_specialized:
-        hybrid = await _run_hybrid_general_search(question)
-        answer = hybrid.get("answer", "")
-        sources = hybrid.get("sources", [])
-        pipeline = hybrid.get("pipeline", "wikipedia")
-        log.info("[LOG] routed_to=%s", pipeline)
-        if conversation_id:
-            conversation_store.add_message(conversation_id, "assistant", answer)
-        return {
-            "answer": answer,
-            "sources": sources,
-            "confidence": 0.85,
-            "intent": intent,
-            "query_analysis": None,
-            "metadata": {"pipeline": pipeline},
-        }
-
     # 3. Domain guard trước retrieval
     if not is_in_document_domain(question):
         answer = OUT_OF_DOMAIN_MESSAGE
@@ -245,7 +191,7 @@ async def process(
                  routed.get("metadata", {}).get("pipeline", "unknown"), len(sources))
 
         # Save document metadata if draft intent
-        if intent == "soan_thao_van_ban" and conversation_id:
+        if intent in ("soan_thao_van_ban", "document_generation") and conversation_id:
             doc_meta = _extract_document_metadata_from_answer(answer, question)
             if doc_meta:
                 conversation_store.update_document_context(conversation_id, doc_meta)
@@ -323,29 +269,12 @@ async def process_stream(
     intent = intent_result["intent"]
     confidence = intent_result["confidence"]
     log.info("[LOG] stream: intent=%s, confidence=%.2f", intent, confidence)
-    is_legal = _is_legal_question(question, utterance_labels)
-    is_specialized = intent in SPECIALIZED_INTENTS and confidence >= 0.5
-
     import json
 
     # Emit intent metadata
     yield json.dumps({"type": "intent", "data": intent_result}, ensure_ascii=False) + "\n"
 
     collected_tokens: list[str] = []
-
-    # Hybrid web search (non-legal): Wikipedia first, then OpenAI web fallback
-    # Skip web search if intent is specialized (admin_planning needs multi-step pipeline)
-    if not is_legal and _should_use_ninh_binh_tool(question) and not is_specialized:
-        hybrid = await _run_hybrid_general_search(question)
-        answer = hybrid.get("answer", "")
-        sources_meta = json.dumps({"type": "sources", "data": hybrid.get("sources", [])}, ensure_ascii=False) + "\n"
-        yield sources_meta
-        collected_tokens.append(sources_meta)
-        yield answer
-        collected_tokens.append(answer)
-        if conversation_id:
-            conversation_store.add_message(conversation_id, "assistant", answer)
-        return
 
     if not is_in_document_domain(question):
         answer = OUT_OF_DOMAIN_MESSAGE
@@ -372,7 +301,7 @@ async def process_stream(
         yield answer
 
         # Save document metadata if draft intent
-        if intent == "soan_thao_van_ban" and conversation_id:
+        if intent in ("soan_thao_van_ban", "document_generation") and conversation_id:
             doc_meta = _extract_document_metadata_from_answer(answer, question)
             if doc_meta:
                 conversation_store.update_document_context(conversation_id, doc_meta)

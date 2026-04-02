@@ -19,18 +19,35 @@ def extract_article_number(text: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def _chunk_key(chunk: Dict) -> str:
-    """Stable dedup key from chunk text prefix."""
-    return (chunk.get("text_chunk") or "")[:120]
+def _chunk_dedup_key(chunk: Dict) -> str:
+    """Stable key: ưu tiên id vector/chunk — tránh gộp nhầm nhiều đoạn khác nhau
+    chỉ vì 120 ký tự đầu trùng (header Điều, v.v.)."""
+    cid = chunk.get("id")
+    if cid is not None and str(cid).strip():
+        return f"id:{cid}"
+    aid = chunk.get("article_id")
+    cl = chunk.get("clause_id")
+    if aid is not None:
+        if cl is not None:
+            return f"a:{aid}:c:{cl}"
+        vtx = chunk.get("vector_id")
+        if vtx is not None:
+            return f"a:{aid}:v:{vtx}"
+    txt = (chunk.get("text_chunk") or "").strip()
+    if len(txt) >= 24:
+        return f"txt:{txt[:500]}"
+    return ""
 
 
 def dedup_chunks(chunks: List[Dict]) -> List[Dict]:
-    """Remove duplicate chunks based on text prefix."""
+    """Remove duplicate chunks (same id / cùng điều-khoản / trùng đoạn dài)."""
     seen: set[str] = set()
     out: List[Dict] = []
-    for c in chunks:
-        key = _chunk_key(c)
-        if key and key not in seen:
+    for i, c in enumerate(chunks):
+        key = _chunk_dedup_key(c)
+        if not key:
+            key = f"row:{i}:{hash((c.get('article_id'), c.get('document_id'), (c.get('text_chunk') or '')[:800]))}"
+        if key not in seen:
             seen.add(key)
             out.append(c)
     return out

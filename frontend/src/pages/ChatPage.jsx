@@ -101,21 +101,20 @@ export default function ChatPage({
     setStreaming(true);
     setCurrentSources(null);
 
-    let botText = "";
-
     try {
       await chatStream(
         question,
         temperature,
         (token) => {
-          botText += token;
           setMessages((prev) => {
             const copy = [...prev];
             const lastIdx = copy.length - 1;
+            const prevBot = copy[lastIdx]?.role === "bot" ? copy[lastIdx].content : "";
+            const nextContent = prevBot + token;
             if (copy[lastIdx]?.role === "bot") {
-              copy[lastIdx] = { ...copy[lastIdx], content: botText };
+              copy[lastIdx] = { ...copy[lastIdx], content: nextContent };
             } else {
-              copy.push({ role: "bot", content: botText });
+              copy.push({ role: "bot", content: nextContent });
             }
             return copy;
           });
@@ -152,7 +151,6 @@ export default function ChatPage({
         },
         (fin) => {
           const text = fin.text ?? "";
-          botText = text;
           setMessages((prev) => {
             const copy = [...prev];
             const lastIdx = copy.length - 1;

@@ -48,38 +48,111 @@ def query_demands_specific_article(query: str) -> bool:
 
 # ── Mức phạt / thẩm quyền ─────────────────────────────────────────────
 
-_MUC_PHAT_QUERY_RE = re.compile(
-    r"mức\s+phạt|mức\s+xử\s+phạt|phạt\s+bao\s+nhiêu"
-    r"|bị\s+phạt\s*(bao\s+nhiêu|như\s+thế\s+nào|thế\s+nào)"
-    r"|tiền\s+phạt|mức\s+tiền\s+phạt|hình\s+thức\s+xử\s+phạt",
-    re.IGNORECASE,
+_FINE_QUERY_MARKERS = (
+    "mức phạt",
+    "mức xử phạt",
+    "phạt bao nhiêu",
+    "bị phạt bao nhiêu",
+    "bị phạt như thế nào",
+    "bị phạt thế nào",
+    "tiền phạt",
+    "mức tiền phạt",
+    "hình thức xử phạt",
 )
 
-_THAM_QUYEN_TITLE_RE = re.compile(r"thẩm\s+quyền", re.IGNORECASE)
-
-_THAM_QUYEN_CONTEXT_RE = re.compile(
-    r"thẩm\s+quyền\s+xử\s+phạt"
-    r"|có\s+quyền\s*[:\-]?\s*(?:[a-z]\)\s*(?:phạt|cảnh\s+cáo)|xử\s+phạt)"
-    r"|được\s+quyền\s+phạt\s+tiền"
-    r"|có\s+quyền\s+(?:phạt\s+tiền|cảnh\s+cáo|tịch\s+thu)",
-    re.IGNORECASE,
+_THAM_QUYEN_MARKERS = ("thẩm quyền",)
+_AUTHORITY_CONTEXT_MARKERS = (
+    "thẩm quyền xử phạt",
+    "có quyền xử phạt",
+    "được quyền phạt tiền",
+    "có quyền phạt tiền",
+    "có quyền cảnh cáo",
+    "có quyền tịch thu",
 )
+
+_LEGAL_SYNTHESIS_MARKERS = (
+    "xử phạt vi phạm hành chính",
+    "vi phạm hành chính",
+    "không lập biên bản",
+    "lập biên bản",
+    "cưỡng chế",
+    "quyết định xử phạt",
+    "hình thức xử phạt",
+    "theo luật",
+    "theo nghị định",
+    "quy định của pháp luật",
+    "bao nhiêu",
+    "là gì",
+    "ở đâu",
+    "như thế nào",
+    "quy định thế nào",
+    "văn bản nào",
+    "theo văn bản nào",
+    "gồm những yêu cầu",
+    "gồm những nội dung",
+    "trách nhiệm gồm những",
+    "được quy định ở đâu",
+    "tiếp nhận",
+    "tin báo",
+    "can thiệp",
+)
+
+_PROCEDURAL_MARKERS = (
+    "thủ tục",
+    "quy trình",
+    "hồ sơ",
+    "thành phần hồ sơ",
+    "giấy phép",
+    "cấp phép",
+    "đăng ký",
+    "xin phép",
+    "điều kiện",
+)
+
+_CONDITION_GATE_MARKERS = ("điều kiện", "đủ điều kiện", "yêu cầu")
+_CONDITION_ACTIVITY_MARKERS = (
+    "đăng ký",
+    "thành lập",
+    "cấp phép",
+    "hoạt động",
+    "giấy phép",
+    "thủ tục",
+    "xin phép",
+    "mở cơ sở",
+    "trợ giúp xã hội",
+    "chứng nhận đủ điều kiện",
+    "kinh doanh có điều kiện",
+)
+_CONDITION_RESOURCE_LEFT_MARKERS = ("cơ sở vật chất", "nhân lực", "trang thiết bị")
+_CONDITION_RESOURCE_RIGHT_MARKERS = ("yêu cầu", "điều kiện", "thế nào")
+
+_PROHIBITED_ACTS_MARKERS = (
+    "hành vi bị cấm",
+    "các hành vi cấm",
+    "trích xuất",
+    "liệt kê",
+)
+
+
+def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
+    t = (text or "").lower()
+    return any(m in t for m in markers)
 
 
 def query_asks_fine_amount(query: str) -> bool:
-    return bool(_MUC_PHAT_QUERY_RE.search(query or ""))
+    return _contains_any(query, _FINE_QUERY_MARKERS)
 
 
 def title_contains_tham_quyen(title: str) -> bool:
-    return bool(_THAM_QUYEN_TITLE_RE.search(title or ""))
+    return _contains_any(title, _THAM_QUYEN_MARKERS)
 
 
 def query_contains_tham_quyen(query: str) -> bool:
-    return bool(_THAM_QUYEN_TITLE_RE.search(query or ""))
+    return _contains_any(query, _THAM_QUYEN_MARKERS)
 
 
 def context_describes_authority(context: str) -> bool:
-    return bool(_THAM_QUYEN_CONTEXT_RE.search(context or ""))
+    return _contains_any(context, _AUTHORITY_CONTEXT_MARKERS)
 
 
 def query_expects_llm_synthesis_from_context(query: str) -> bool:
@@ -92,45 +165,17 @@ def query_expects_llm_synthesis_from_context(query: str) -> bool:
         return True
     if query_contains_tham_quyen(query):
         return True
-    if re.search(
-        r"xử\s+phạt\s+vi\s+phạm\s+hành\s+chính|vi\s+phạm\s+hành\s+chính",
-        q,
-    ):
-        return True
-    if re.search(
-        r"không\s+lập\s+biên\s+bản|lập\s+biên\s+bản|cưỡng\s+chế|"
-        r"quyết\s+định\s+xử\s+phạt|hình\s+thức\s+xử\s+phạt",
-        q,
-    ):
-        return True
-    if re.search(
-        r"luật\s+.+?\s+\d{4}|nghị\s+định\s+\d+/\d{4}|"
-        r"theo\s+luật|theo\s+nghị\s+định|quy\s+định\s+của\s+pháp\s+luật",
-        q,
-    ):
-        return True
-    if re.search(
-        r"\b(bao\s+nhiêu|là\s+gì\b|ở\s+đâu\b|như\s+thế\s+nào\b|"
-        r"quy\s+định\s+thế\s+nào\b|văn\s+bản\s+nào\b|theo\s+văn\s+bản\s+nào\b)\b",
-        q,
-    ):
+    if _contains_any(q, _LEGAL_SYNTHESIS_MARKERS):
         return True
     if "căn cứ pháp lý" in q and ("văn bản" in q or "nào" in q):
         return True
-    if re.search(r"gồm\s+những\s+(yêu\s+cầu|gì|nội\s+dung)\b", q):
+    if "gồm những" in q and ("yêu cầu" in q or "gì" in q or "nội dung" in q):
         return True
-    if re.search(r"trách\s+nhiệm.*gồm\s+những", q):
+    if "điều kiện" in q and "là gì" in q:
         return True
-    if re.search(r"được\s+quy\s+định\s+ở\s+đâu", q):
-        return True
-    if re.search(r"\bđiều\s+kiện\b.+\blà\s+gì\b", q):
-        return True
-    if re.search(
-        r"\b(thủ\s+tục|quy\s+trình)\b.+\b(ở\s+đâu|như\s+thế\s+nào|thế\s+nào)\b",
-        q,
+    if ("thủ tục" in q or "quy trình" in q) and (
+        "ở đâu" in q or "như thế nào" in q or "thế nào" in q
     ):
-        return True
-    if re.search(r"tiếp\s+nhận.*tin\s+báo|can\s+thiệp", q):
         return True
     return False
 
@@ -140,13 +185,7 @@ def query_looks_procedural(query: str) -> bool:
     q = (query or "").lower().strip()
     if not q:
         return False
-    return bool(
-        re.search(
-            r"\b(thủ\s*tục|quy\s*trình|hồ\s*sơ|thành\s*phần\s*hồ\s*sơ|"
-            r"giấy\s*phép|cấp\s*phép|đăng\s*ký|xin\s*phép|điều\s*kiện)\b",
-            q,
-        )
-    )
+    return _contains_any(q, _PROCEDURAL_MARKERS)
 
 
 def query_asks_comprehensive_statutory_coverage(query: str) -> bool:
@@ -154,12 +193,10 @@ def query_asks_comprehensive_statutory_coverage(query: str) -> bool:
     q = (query or "").lower().strip()
     if len(q) < 12:
         return False
-    if re.search(r"chính\s+sách", q) and re.search(
-        r"(nhà\s+nước|quốc\s+gia|đối\s+với|của\s+nước)", q
-    ):
+    if "chính sách" in q and _contains_any(q, ("nhà nước", "quốc gia", "đối với", "của nước")):
         return True
-    if re.search(r"tiêu\s+ch[íi]", q) and re.search(
-        r"(phân\s+loại|dự\s+án|trọng\s+điểm|quốc\s+gia)", q
+    if ("tiêu chí" in q or "tiêu chi" in q) and _contains_any(
+        q, ("phân loại", "dự án", "trọng điểm", "quốc gia")
     ):
         return True
     if "trọng điểm quốc gia" in q or "dự án trọng điểm quốc gia" in q:
@@ -174,23 +211,14 @@ def query_asks_structured_registration_conditions(query: str) -> bool:
     q = (query or "").lower().strip()
     if not q:
         return False
-    if not re.search(r"\bđiều\s+kiện\b|\bđủ\s+điều\s+kiện\b|\byêu\s+cầu\b", q):
+    if not _contains_any(q, _CONDITION_GATE_MARKERS):
         return False
-    if re.search(
-        r"đăng\s+ký|thành\s+lập|cấp\s+phép|hoạt\s+động|giấy\s+phép|"
-        r"thủ\s+tục|xin\s+phép|mở\s+cơ\s+sở|trợ\s+giúp\s+xã\s+hội|"
-        r"chứng\s+nhận\s+đủ\s+điều\s+kiện|kinh\s+doanh\s+có\s+điều\s+kiện",
-        q,
-    ):
+    if _contains_any(q, _CONDITION_ACTIVITY_MARKERS):
         return True
-    if re.search(
-        r"điều\s+kiện\s+(là\s+gì|gì|như\s+thế\s+nào|ra\s+sao|bao\s+gồm)",
-        q,
-    ):
+    if "điều kiện" in q and _contains_any(q, ("là gì", "gì", "như thế nào", "ra sao", "bao gồm")):
         return True
-    if re.search(
-        r"(cơ\s+sở\s+vật\s+chất|nhân\s+lực|trang\s+thiết\s+bị).{0,40}(yêu\s+cầu|điều\s+kiện|thế\s+nào)",
-        q,
+    if _contains_any(q, _CONDITION_RESOURCE_LEFT_MARKERS) and _contains_any(
+        q, _CONDITION_RESOURCE_RIGHT_MARKERS
     ):
         return True
     return False
@@ -203,13 +231,9 @@ def query_requests_prohibited_acts_list(query: str) -> bool:
         return False
     if "nghiêm cấm" in q:
         return True
-    return bool(
-        re.search(
-            r"(hành\s*vi\s*bị\s*cấm|các\s*hành\s*vi\s*cấm|"
-            r"trích\s*xuất.*hành\s*vi|liệt\s*kê.*hành\s*vi.*cấm)",
-            q,
-        )
-    )
+    if "hành vi" in q and "cấm" in q:
+        return True
+    return _contains_any(q, _PROHIBITED_ACTS_MARKERS)
 
 
 # ── Làm sạch output LLM ────────────────────────────────────────────────
@@ -351,20 +375,16 @@ def tokenize_query_words_alnum(query_lower: str) -> List[str]:
 
 
 def document_type_quyet_dinh_is_false_positive(query_lower: str) -> bool:
-    return bool(
-        re.search(
-            r"thẩm quyền\s+quyết định|quyền\s+quyết định|được\s+quyết định",
-            query_lower,
-        )
+    return _contains_any(
+        query_lower,
+        ("thẩm quyền quyết định", "quyền quyết định", "được quyết định"),
     )
 
 
 def document_type_luat_is_false_positive(query_lower: str) -> bool:
-    return bool(
-        re.search(
-            r"điều\s+luật|các\s+điều\s+luật|theo\s+điều\s+luật",
-            query_lower,
-        )
+    return _contains_any(
+        query_lower,
+        ("điều luật", "các điều luật", "theo điều luật"),
     )
 
 

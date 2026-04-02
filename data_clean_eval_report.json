@@ -1,0 +1,797 @@
+{
+  "summary": {
+    "n": 20,
+    "with_answers": false,
+    "intent_accuracy": 0.95,
+    "rag_all_three_accuracy": 1.0,
+    "fully_correct_accuracy": 0.95,
+    "per_rag_flag_accuracy": {
+      "needs_expansion": 1.0,
+      "use_multi_article": 1.0,
+      "is_legal_lookup": 1.0
+    },
+    "data_clean_path": "D:\\DSAI\\code\\ChatBot\\rag_chatbot\\data_clean.json"
+  },
+  "items": [
+    {
+      "input": "Nếu trong quy hoạch có mâu thuẫn giữa các quy hoạch khác nhau mà việc lựa chọn quy hoạch nào được thực hiện không tuân thủ cơ chế xử lý mâu thuẫn thì có thể bị đánh giá sai quy trình không?",
+      "output": {
+        "intent": "admin_scenario",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "answer": "",
+      "predicted": {
+        "intent": "admin_scenario",
+        "detector_confidence": 0.94,
+        "routing_intent": "admin_scenario",
+        "ab_method": "rule",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "correct": {
+        "intent": true,
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": true
+        },
+        "all_rag_flags": true,
+        "fully_correct": true
+      },
+      "scores": {
+        "intent_correct": 1,
+        "rag_correct_fields": 3,
+        "rag_total_fields": 3,
+        "per_question_score": 1.0
+      }
+    },
+    {
+      "input": "Người dân phản ánh tình trạng 1 hộ gia đình tổ chức tiệc tùng sử dụng loa kéo công suất lớn (karaoke di động) hát quá khuya trong khu dân cư. Với thẩm quyền của mình, ông/bà chỉ đạo lực lượng công an xã và cán bộ văn hóa thực hiện các bước đo đạc tiếng ồn và xử lý vi phạm theo Nghị định 144/2021/NĐ-CP như thế nào?",
+      "output": {
+        "intent": "admin_scenario",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "answer": "",
+      "predicted": {
+        "intent": "admin_scenario",
+        "detector_confidence": 0.94,
+        "routing_intent": "admin_scenario",
+        "ab_method": "rule",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "correct": {
+        "intent": true,
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": true
+        },
+        "all_rag_flags": true,
+        "fully_correct": true
+      },
+      "scores": {
+        "intent_correct": 1,
+        "rag_correct_fields": 3,
+        "rag_total_fields": 3,
+        "per_question_score": 1.0
+      }
+    },
+    {
+      "input": "Một ngôi chùa là di tích lịch sử cấp quốc gia trên địa bàn bị dột nát nghiêm trọng sau bão. Trụ trì nhà chùa muốn tự bỏ kinh phí để thay mới toàn bộ hệ thống mái ngói theo kiến trúc hiện đại cho bền. Ông/bà sẽ giải thích và hướng dẫn quy trình xin phép trùng tu, tôn tạo di tích như thế nào để không làm biến dạng yếu tố gốc của di tích?",
+      "output": {
+        "intent": "admin_scenario",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "answer": "",
+      "predicted": {
+        "intent": "admin_scenario",
+        "detector_confidence": 0.94,
+        "routing_intent": "admin_scenario",
+        "ab_method": "rule",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "correct": {
+        "intent": true,
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": true
+        },
+        "all_rag_flags": true,
+        "fully_correct": true
+      },
+      "scores": {
+        "intent_correct": 1,
+        "rag_correct_fields": 3,
+        "rag_total_fields": 3,
+        "per_question_score": 1.0
+      }
+    },
+    {
+      "input": "Trong đợt kiểm tra liên ngành, đoàn kiểm tra phát hiện một đại lý Internet có nhiều học sinh đang chơi trò chơi điện tử trong giờ học chính khóa. Ông/bà sẽ xử lý vi phạm đối với chủ cơ sở này ra sao và phối hợp với nhà trường, gia đình như thế nào để quản lý học sinh?",
+      "output": {
+        "intent": "admin_scenario",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "answer": "",
+      "predicted": {
+        "intent": "violation",
+        "detector_confidence": 0.9,
+        "routing_intent": "violation",
+        "ab_method": "rule",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "correct": {
+        "intent": false,
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": true
+        },
+        "all_rag_flags": true,
+        "fully_correct": false
+      },
+      "scores": {
+        "intent_correct": 0,
+        "rag_correct_fields": 3,
+        "rag_total_fields": 3,
+        "per_question_score": 0.75
+      }
+    },
+    {
+      "input": "Tại một thôn, có sự mâu thuẫn giữa Ban vận động xây dựng đời sống văn hóa và người dân về việc đóng góp kinh phí xây dựng cổng làng quá cao. Với vai trò phụ trách, ông/bà sẽ tổ chức đối thoại và giải quyết dựa trên nguyên tắc tự nguyện và dân chủ cơ sở như thế nào?",
+      "output": {
+        "intent": "admin_scenario",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "answer": "",
+      "predicted": {
+        "intent": "admin_scenario",
+        "detector_confidence": 0.9,
+        "routing_intent": "admin_scenario",
+        "ab_method": "rule",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "correct": {
+        "intent": true,
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": true
+        },
+        "all_rag_flags": true,
+        "fully_correct": true
+      },
+      "scores": {
+        "intent_correct": 1,
+        "rag_correct_fields": 3,
+        "rag_total_fields": 3,
+        "per_question_score": 1.0
+      }
+    },
+    {
+      "input": "Có thông tin một nhóm người lạ mặt đến địa phương tổ chức sinh hoạt tôn giáo trái phép tại nhà riêng của một hộ dân. Ông/bà cần phối hợp với các ban ngành liên quan để xác minh, vận động và xử lý tình huống này nhằm đảm bảo an ninh trật tự và đúng Luật Tín ngưỡng, tôn giáo?",
+      "output": {
+        "intent": "admin_scenario",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "answer": "",
+      "predicted": {
+        "intent": "admin_scenario",
+        "detector_confidence": 0.94,
+        "routing_intent": "admin_scenario",
+        "ab_method": "rule",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "correct": {
+        "intent": true,
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": true
+        },
+        "all_rag_flags": true,
+        "fully_correct": true
+      },
+      "scores": {
+        "intent_correct": 1,
+        "rag_correct_fields": 3,
+        "rag_total_fields": 3,
+        "per_question_score": 1.0
+      }
+    },
+    {
+      "input": "Xã chuẩn bị tổ chức Đại hội Thể dục thể thao cấp cơ sở. Có ý kiến đề xuất lược bỏ các môn thể thao dân tộc để tập trung vào các môn hiện đại nhằm tiết kiệm thời gian. Ông/bà sẽ tham mưu như thế nào để vừa đảm bảo tính hiện đại, vừa bảo tồn các giá trị văn hóa truyền thống của địa phương?",
+      "output": {
+        "intent": "admin_scenario",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "answer": "",
+      "predicted": {
+        "intent": "admin_scenario",
+        "detector_confidence": 0.94,
+        "routing_intent": "admin_scenario",
+        "ab_method": "rule",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "correct": {
+        "intent": true,
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": true
+        },
+        "all_rag_flags": true,
+        "fully_correct": true
+      },
+      "scores": {
+        "intent_correct": 1,
+        "rag_correct_fields": 3,
+        "rag_total_fields": 3,
+        "per_question_score": 1.0
+      }
+    },
+    {
+      "input": "Phát hiện một trường hợp bạo lực gia đình nghiêm trọng tại địa phương. Với tư cách phụ trách văn hóa - xã hội, ông/bà chỉ đạo các đoàn thể (Hội Phụ nữ, Tư pháp) thực hiện các biện pháp can thiệp, bảo vệ nạn nhân và xử lý người gây bạo lực theo quy định hiện hành như thế nào?",
+      "output": {
+        "intent": "admin_scenario",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "answer": "",
+      "predicted": {
+        "intent": "admin_scenario",
+        "detector_confidence": 0.94,
+        "routing_intent": "admin_scenario",
+        "ab_method": "rule",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "correct": {
+        "intent": true,
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": true
+        },
+        "all_rag_flags": true,
+        "fully_correct": true
+      },
+      "scores": {
+        "intent_correct": 1,
+        "rag_correct_fields": 3,
+        "rag_total_fields": 3,
+        "per_question_score": 1.0
+      }
+    },
+    {
+      "input": "Nhiều biển hiệu của các cửa hàng trên trục đường chính của xã có kích thước quá lớn, che khuất tầm nhìn giao thông và không đúng quy định về ngôn ngữ (chỉ có tiếng nước ngoài). Ông/bà xây dựng kế hoạch ra quân chấn chỉnh và xử lý các vi phạm về biển hiệu, quảng cáo này ra sao?",
+      "output": {
+        "intent": "admin_scenario",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "answer": "",
+      "predicted": {
+        "intent": "admin_scenario",
+        "detector_confidence": 0.94,
+        "routing_intent": "admin_scenario",
+        "ab_method": "rule",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "correct": {
+        "intent": true,
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": true
+        },
+        "all_rag_flags": true,
+        "fully_correct": true
+      },
+      "scores": {
+        "intent_correct": 1,
+        "rag_correct_fields": 3,
+        "rag_total_fields": 3,
+        "per_question_score": 1.0
+      }
+    },
+    {
+      "input": "Nhà văn hóa xã được đầu tư khang trang nhưng tỷ lệ người dân đến sinh hoạt rất thấp, gây lãng phí. Ông/bà hãy đề xuất 3 giải pháp đổi mới phương thức hoạt động để thu hút các câu lạc bộ, tổ, đội nhóm và nhân dân đến sử dụng thiết chế văn hóa này hiệu quạ hơn.",
+      "output": {
+        "intent": "admin_scenario",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "answer": "",
+      "predicted": {
+        "intent": "admin_scenario",
+        "detector_confidence": 0.94,
+        "routing_intent": "admin_scenario",
+        "ab_method": "rule",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "correct": {
+        "intent": true,
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": true
+        },
+        "all_rag_flags": true,
+        "fully_correct": true
+      },
+      "scores": {
+        "intent_correct": 1,
+        "rag_correct_fields": 3,
+        "rag_total_fields": 3,
+        "per_question_score": 1.0
+      }
+    },
+    {
+      "input": "Địa phương có một loại hình nghệ thuật truyền thống đang có nguy cơ mai một do các nghệ nhân cao tuổi qua đời. Ông/bà tham mưu cho Đảng ủy, HĐND xã ban hành nghị quyết hoặc kế hoạch gì để hỗ trợ việc truyền dạy và bảo tồn di sản này trong thế hệ trẻ?",
+      "output": {
+        "intent": "admin_scenario",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "answer": "",
+      "predicted": {
+        "intent": "admin_scenario",
+        "detector_confidence": 0.94,
+        "routing_intent": "admin_scenario",
+        "ab_method": "rule",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "correct": {
+        "intent": true,
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": true
+        },
+        "all_rag_flags": true,
+        "fully_correct": true
+      },
+      "scores": {
+        "intent_correct": 1,
+        "rag_correct_fields": 3,
+        "rag_total_fields": 3,
+        "per_question_score": 1.0
+      }
+    },
+    {
+      "input": "Ngành, nghề ưu đãi đầu tư và địa bàn ưu đãi đầu tư được quy định như thế nào?",
+      "output": {
+        "intent": "legal_lookup",
+        "rag_flags": {
+          "needs_expansion": false,
+          "use_multi_article": false,
+          "is_legal_lookup": false
+        }
+      },
+      "answer": "",
+      "predicted": {
+        "intent": "legal_lookup",
+        "detector_confidence": 0.88,
+        "routing_intent": "legal_lookup",
+        "ab_method": "rule",
+        "rag_flags": {
+          "needs_expansion": false,
+          "use_multi_article": false,
+          "is_legal_lookup": false
+        }
+      },
+      "correct": {
+        "intent": true,
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": true
+        },
+        "all_rag_flags": true,
+        "fully_correct": true
+      },
+      "scores": {
+        "intent_correct": 1,
+        "rag_correct_fields": 3,
+        "rag_total_fields": 3,
+        "per_question_score": 1.0
+      }
+    },
+    {
+      "input": " Thời hiệu xử phạt vi phạm hành chính trong lĩnh vực văn hóa du lịch?",
+      "output": {
+        "intent": "legal_lookup",
+        "rag_flags": {
+          "needs_expansion": false,
+          "use_multi_article": false,
+          "is_legal_lookup": false
+        }
+      },
+      "answer": "",
+      "predicted": {
+        "intent": "legal_lookup",
+        "detector_confidence": 0.93,
+        "routing_intent": "legal_lookup",
+        "ab_method": "rule",
+        "rag_flags": {
+          "needs_expansion": false,
+          "use_multi_article": false,
+          "is_legal_lookup": false
+        }
+      },
+      "correct": {
+        "intent": true,
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": true
+        },
+        "all_rag_flags": true,
+        "fully_correct": true
+      },
+      "scores": {
+        "intent_correct": 1,
+        "rag_correct_fields": 3,
+        "rag_total_fields": 3,
+        "per_question_score": 1.0
+      }
+    },
+    {
+      "input": " Tiêu chí phân loại dự án đầu tư công như thế nào?",
+      "output": {
+        "intent": "legal_lookup",
+        "rag_flags": {
+          "needs_expansion": false,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "answer": "",
+      "predicted": {
+        "intent": "legal_lookup",
+        "detector_confidence": 0.93,
+        "routing_intent": "legal_lookup",
+        "ab_method": "rule",
+        "rag_flags": {
+          "needs_expansion": false,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "correct": {
+        "intent": true,
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": true
+        },
+        "all_rag_flags": true,
+        "fully_correct": true
+      },
+      "scores": {
+        "intent_correct": 1,
+        "rag_correct_fields": 3,
+        "rag_total_fields": 3,
+        "per_question_score": 1.0
+      }
+    },
+    {
+      "input": "Tóm tắt cấu trúc các cột cần có trong báo cáo tình hình khai thác tài sản kết cấu hạ tầng chợ (phương thức: chủ thể thuê quyền khai thác).",
+      "output": {
+        "intent": "summarization",
+        "rag_flags": {
+          "needs_expansion": false,
+          "use_multi_article": false,
+          "is_legal_lookup": false
+        }
+      },
+      "answer": "",
+      "predicted": {
+        "intent": "summarization",
+        "detector_confidence": 0.95,
+        "routing_intent": "document_summary",
+        "ab_method": "rule",
+        "rag_flags": {
+          "needs_expansion": false,
+          "use_multi_article": false,
+          "is_legal_lookup": false
+        }
+      },
+      "correct": {
+        "intent": true,
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": true
+        },
+        "all_rag_flags": true,
+        "fully_correct": true
+      },
+      "scores": {
+        "intent_correct": 1,
+        "rag_correct_fields": 3,
+        "rag_total_fields": 3,
+        "per_question_score": 1.0
+      }
+    },
+    {
+      "input": "Lập khung checklist báo cáo tình hình khai thác tài sản kết cấu hạ tầng chợ (phương thức: chủ thể thuê/khai thác quyền; thời hạn thuê; tổng tiền phải thu; chi phí liên quan; nộp tài khoản tạm giữ; nộp ngân sách).",
+      "output": {
+        "intent": "document_generation",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": false,
+          "is_legal_lookup": false
+        }
+      },
+      "answer": "",
+      "predicted": {
+        "intent": "document_generation",
+        "detector_confidence": 0.96,
+        "routing_intent": "checklist_documents",
+        "ab_method": "rule",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": false,
+          "is_legal_lookup": false
+        }
+      },
+      "correct": {
+        "intent": true,
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": true
+        },
+        "all_rag_flags": true,
+        "fully_correct": true
+      },
+      "scores": {
+        "intent_correct": 1,
+        "rag_correct_fields": 3,
+        "rag_total_fields": 3,
+        "per_question_score": 1.0
+      }
+    },
+    {
+      "input": "Nếu quỹ sử dụng tên và biểu tượng gây nhầm lẫn với quỹ khác thì có thể bị xem là không đáp ứng điều kiện thành lập và hoạt động không?",
+      "output": {
+        "intent": "violation",
+        "rag_flags": {
+          "needs_expansion": false,
+          "use_multi_article": false,
+          "is_legal_lookup": true
+        }
+      },
+      "answer": "",
+      "predicted": {
+        "intent": "violation",
+        "detector_confidence": 0.93,
+        "routing_intent": "violation",
+        "ab_method": "rule",
+        "rag_flags": {
+          "needs_expansion": false,
+          "use_multi_article": false,
+          "is_legal_lookup": true
+        }
+      },
+      "correct": {
+        "intent": true,
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": true
+        },
+        "all_rag_flags": true,
+        "fully_correct": true
+      },
+      "scores": {
+        "intent_correct": 1,
+        "rag_correct_fields": 3,
+        "rag_total_fields": 3,
+        "per_question_score": 1.0
+      }
+    },
+    {
+      "input": "Giải thích vì sao dự thảo điều lệ là tài liệu bắt buộc trong hồ sơ mở rộng phạm vi hoạt động quỹ theo Nghị định 03/2026.",
+      "output": {
+        "intent": "legal_explanation",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": false,
+          "is_legal_lookup": false
+        }
+      },
+      "answer": "",
+      "predicted": {
+        "intent": "legal_explanation",
+        "detector_confidence": 0.92,
+        "routing_intent": "legal_explanation",
+        "ab_method": "rule",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": false,
+          "is_legal_lookup": false
+        }
+      },
+      "correct": {
+        "intent": true,
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": true
+        },
+        "all_rag_flags": true,
+        "fully_correct": true
+      },
+      "scores": {
+        "intent_correct": 1,
+        "rag_correct_fields": 3,
+        "rag_total_fields": 3,
+        "per_question_score": 1.0
+      }
+    },
+    {
+      "input": "Nếu hồ sơ đề nghị cấp/cấp lại chứng chỉ hành nghề bảo quản, tu bổ, phục hồi di tích theo Nghị định 308/2025 không thể hiện cam kết hành nghề đúng nội dung chứng chỉ được cấp thì có thể bị yêu cầu bổ sung/không đạt điều kiện xét không?",
+      "output": {
+        "intent": "violation",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": false,
+          "is_legal_lookup": false
+        }
+      },
+      "answer": "",
+      "predicted": {
+        "intent": "violation",
+        "detector_confidence": 0.93,
+        "routing_intent": "violation",
+        "ab_method": "rule",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": false,
+          "is_legal_lookup": false
+        }
+      },
+      "correct": {
+        "intent": true,
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": true
+        },
+        "all_rag_flags": true,
+        "fully_correct": true
+      },
+      "scores": {
+        "intent_correct": 1,
+        "rag_correct_fields": 3,
+        "rag_total_fields": 3,
+        "per_question_score": 1.0
+      }
+    },
+    {
+      "input": "So sánh danh mục thành viên câu lạc bộ/nhóm thực hành di sản văn hóa phi vật thể theo Nghị định 308/2025 với danh mục nguồn thu của quỹ trong mẫu tài chính quỹ theo Nghị định 03/2026 (điểm chung là yêu cầu dữ liệu có cấu trúc).",
+      "output": {
+        "intent": "comparison",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "answer": "",
+      "predicted": {
+        "intent": "comparison",
+        "detector_confidence": 0.95,
+        "routing_intent": "comparison",
+        "ab_method": "rule",
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": false
+        }
+      },
+      "correct": {
+        "intent": true,
+        "rag_flags": {
+          "needs_expansion": true,
+          "use_multi_article": true,
+          "is_legal_lookup": true
+        },
+        "all_rag_flags": true,
+        "fully_correct": true
+      },
+      "scores": {
+        "intent_correct": 1,
+        "rag_correct_fields": 3,
+        "rag_total_fields": 3,
+        "per_question_score": 1.0
+      }
+    }
+  ]
+}

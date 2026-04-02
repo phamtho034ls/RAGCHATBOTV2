@@ -6,7 +6,7 @@ cho các cấp chính quyền tại Ninh Bình.
 
 Pipeline:
     Query → extract_location() → lookup_local_data()
-          → Ninh Bình web search → structured result
+          → (Ninh Bình web search removed) → structured result
 """
 
 from __future__ import annotations
@@ -63,33 +63,18 @@ async def lookup_local_data(
     Returns:
         Dict with location, admin_level, data (text answer), sources.
     """
-    from app.services.ninh_binh_web_search import search_ninh_binh
-
     location = extract_location(query) or query
-
-    search_queries = {
-        "general": (
-            f"thông tin hành chính {location} Ninh Bình "
-            f"dân số diện tích đơn vị hành chính"
-        ),
-        "population": f"dân số {location} Ninh Bình",
-        "area": f"diện tích {location} Ninh Bình",
-        "admin_units": (
-            f"đơn vị hành chính {location} Ninh Bình "
-            f"số xã phường thôn xóm"
-        ),
-    }
-
-    search_q = search_queries.get(data_type, search_queries["general"])
-    log.info("[LOCAL_DATA] query=%s, data_type=%s", location, data_type)
-
-    result = await search_ninh_binh(search_q)
+    log.info(
+        "[LOCAL_DATA] local web_search removed; query=%s, data_type=%s",
+        location,
+        data_type,
+    )
     admin_level = detect_admin_level(query)
 
     return {
         "location": location,
         "admin_level": admin_level,
-        "data": result.get("answer", ""),
-        "sources": result.get("sources", []),
+        "data": "",
+        "sources": [],
         "data_type": data_type,
     }

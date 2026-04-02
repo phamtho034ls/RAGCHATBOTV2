@@ -509,6 +509,19 @@ async def _fetch_full_article_chunks(
     return article_chunks
 
 
+def _item_matches_domain_filter(item: Dict, allowed: set[str]) -> bool:
+    """Khớp legal_domain hoặc bất kỳ nhãn nào trong law_intents (sau enrich)."""
+    dom = item.get("legal_domain")
+    if dom and str(dom) in allowed:
+        return True
+    raw = item.get("law_intents")
+    if isinstance(raw, list):
+        labels = {str(x) for x in raw if x and str(x) != "chung"}
+        if allowed & labels:
+            return True
+    return False
+
+
 def _doc_topic_labels(item: Dict) -> set:
     """Domains associated with a passage (Qdrant payload + DB fallback)."""
     raw = item.get("law_intents")
@@ -762,7 +775,34 @@ async def _direct_article_lookup(
     )
     rows = (await db.execute(stmt)).all()
     if not rows:
-        return []
+        for variant in _doc_ref_to_search_variants(resolved_doc_number):
+            if not variant or len(variant) < 6:
+                continue
+            stmt_f = (
+                select(
+                    Article.id,
+                    Article.article_number,
+                    Article.title,
+                    Document.id.label("document_id"),
+                    Document.title.label("document_title"),
+                )
+                .join(Document, Article.document_id == Document.id)
+                .where(func.upper(Document.doc_number).like(f"%{variant.upper()}%"))
+                .limit(400)
+            )
+            rows = (await db.execute(stmt_f)).all()
+            if rows:
+                dids = {getattr(r, "document_id", None) for r in rows}
+                if len(dids) == 1:
+                    log.info(
+                        "[DIRECT] Fuzzy doc_number match (variant=%s) → %d articles",
+                        variant,
+                        len(rows),
+                    )
+                    break
+                rows = []
+        if not rows:
+            return []
 
     doc_title = (getattr(rows[0], "document_title", None) or "") or ""
     if (
@@ -809,7 +849,36 @@ async def _direct_article_lookup(
             result.extend(chunks)
         return result
 
-    return []
+    # Câu hỏi tình huống dài (tiếng ồn, karaoke, chỉ đạo xử lý…) — tiêu đề Điều hiếm khi đạt ngưỡng
+    # title_similarity; vẫn cần ngữ cảnh từ đúng văn bản được trích dẫn.
+    doc_id = getattr(rows[0], "document_id", None)
+    if doc_id is None:
+        return []
+
+    stmt_ov = (
+        select(Article.id, Article.title, Article.content)
+        .where(Article.document_id == doc_id)
+    )
+    all_arts = (await db.execute(stmt_ov)).all()
+    ov_scored: List[tuple[float, int]] = []
+    for ar in all_arts:
+        blob = f"{(ar.title or '').strip()}\n{(ar.content or '')[:4500]}"
+        ov_scored.append((_keyword_overlap(query, blob), ar.id))
+    ov_scored.sort(key=lambda x: x[0], reverse=True)
+
+    cap = min(18, max(1, len(ov_scored)))
+    if ov_scored and ov_scored[0][0] > 0:
+        pick = [aid for _, aid in ov_scored[:cap]]
+    else:
+        pick = [r.id for r in rows[: min(15, len(rows))]]
+
+    log.info(
+        "[DIRECT] Scenario-style query → %d articles by content overlap (best=%.3f) for '%s'",
+        len(pick),
+        ov_scored[0][0] if ov_scored else 0.0,
+        resolved_doc_number,
+    )
+    return await _flatten_chunks_for_article_ids(db, pick, 0.78)
 
 
 async def hybrid_search(
@@ -899,6 +968,27 @@ async def hybrid_search(
         doc_number=resolved_doc_number,
     )
 
+    # ── 1b. Vector lọc domain trả về 0 nhưng keyword (ILIKE) vẫn có — bổ sung vector không lọc
+    # để không chỉ dựa vào từ khóa rời (dễ kéo nhầm văn bản khác lĩnh vực).
+    vector_broad: List[Dict] = []
+    if (
+        legal_domains
+        and not resolved_doc_number
+        and len(vector_results) == 0
+        and len(keyword_results) >= 3
+    ):
+        log.info(
+            "Domain-filtered vector returned 0 hits; supplementing unfiltered vector (domains=%s)",
+            legal_domains,
+        )
+        vector_broad = vector_search(
+            query=query,
+            top_k=fetch_k,
+            doc_number=None,
+            document_id=document_id,
+            legal_domains=None,
+        )
+
     # ── 2b. Fallback: if filtered search returned too few results, retry without filters
     # Không bỏ lọc số hiệu khi người dùng nêu rõ văn bản — tránh kéo nhầm NĐ/luật khác (vd. 137 vs 138).
     if (resolved_doc_number or legal_domains) and (len(vector_results) + len(keyword_results)) < 3:
@@ -922,7 +1012,10 @@ async def hybrid_search(
             keyword_results = await keyword_search(query=query, db=db, top_k=fetch_k)
 
     # ── 3. Merge with RRF ────────────────────────────────
-    merged = _reciprocal_rank_fusion(vector_results, keyword_results)
+    if vector_broad:
+        merged = _reciprocal_rank_fusion(vector_results, vector_broad, keyword_results)
+    else:
+        merged = _reciprocal_rank_fusion(vector_results, keyword_results)
 
     if not merged:
         log.warning("No results from hybrid search for: '%.60s...'", query)
@@ -952,7 +1045,7 @@ async def hybrid_search(
     # Only keep passages that explicitly match allowed domains; drop empty/other to avoid wrong-law citations.
     if legal_domains and reranked:
         allowed = set(legal_domains)
-        filtered = [item for item in reranked if item.get("legal_domain") in allowed]
+        filtered = [item for item in reranked if _item_matches_domain_filter(item, allowed)]
         if filtered:
             reranked = filtered
             log.info("Domain post-filter: %d → %d passages (allowed=%s)", len(merged), len(reranked), list(allowed))

@@ -22,7 +22,8 @@ DRAFT_SYSTEM = (
     "Bạn là chuyên gia soạn thảo văn bản hành chính nhà nước Việt Nam. "
     "Hãy soạn thảo văn bản theo đúng thể thức văn bản hành chính. "
     "CHỈ ĐƯỢC ghi và trích dẫn căn cứ pháp lý, số hiệu văn bản từ TÀI LIỆU THAM KHẢO được cung cấp trong câu trả lời. "
-    "TUYỆT ĐỐI KHÔNG bịa đặt số hiệu văn bản pháp luật từ kiến thức bên ngoài."
+    "TUYỆT ĐỐI KHÔNG bịa đặt số hiệu văn bản pháp luật từ kiến thức bên ngoài. "
+    "Phần căn cứ pháp lý phải nêu rõ nội dung Điều/Khoản liên quan, không chỉ liệt kê tên văn bản."
 )
 
 DRAFT_PROMPT = """Hãy soạn thảo văn bản hành chính theo yêu cầu sau:
@@ -75,6 +76,7 @@ BẮT BUỘC tuân thủ thể thức văn bản hành chính Việt Nam:
 9. CĂN CỨ PHÁP LÝ (NGUYÊN TẮC QUAN TRỌNG):
    - CHỈ ĐƯỢC trích dẫn văn bản pháp luật có SỐ HIỆU xuất hiện trong TÀI LIỆU THAM KHẢO ở trên.
    - BẮT BUỘC ghi rõ SỐ HIỆU văn bản (ví dụ: 23/2025/TT-BVHTTDL, 86/2023/NĐ-CP), kèm tên đầy đủ.
+   - Với mỗi căn cứ phải nêu Điều/Khoản áp dụng và tóm lược nội dung quy định.
    - TUYỆT ĐỐI KHÔNG ĐƯỢC bịa đặt hoặc thêm văn bản từ kiến thức bên ngoài.
    - Nếu TÀI LIỆU THAM KHẢO không có căn cứ pháp lý phù hợp thì để trống phần căn cứ.
    - KHÔNG ĐƯỢC tự nghĩ ra số hiệu nghị định, thông tư, luật.

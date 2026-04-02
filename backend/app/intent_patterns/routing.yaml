@@ -51,6 +51,54 @@ structural_rules:
     confidence: 0.93
     patterns:
       - '(?i)\bsố\s+[\d/.-]{4,}\b.{0,30}\b(nghị\s*định|quyết\s*định|thông\s*tư|luật)\b'
+  - intent_id: tra_cuu_van_ban
+    priority: 94
+    confidence: 0.93
+    patterns:
+      - '(?i)\bthời\s*hiệu\s+xử\s*phạt\b'
+      - '(?i)\btiêu\s*chí\s+phân\s*loại\b.{0,40}\bdự\s*án\s+đầu\s*tư\s*công\b'
+
+  # --- Soạn thảo / mẫu biểu (ưu tiên trước thủ tục để tránh nuốt nhãn) ---
+  - intent_id: soan_thao_van_ban
+    priority: 95
+    confidence: 0.96
+    patterns:
+      - '(?i)\b(mẫu|biểu\s*mẫu|form)\b.{0,40}\b(đơn|giấy|tờ\s*khai|quyết\s*định|công\s*văn|thông\s*báo|báo\s*cáo)\b'
+      - '(?i)\b(soạn|viết|lập|tạo)\b.{0,40}\b(mẫu|khung|dàn\s*ý|checklist)\b'
+      - '(?i)\b(mẫu\s+đơn|mẫu\s+giấy|mẫu\s+báo\s*cáo)\b.{0,40}\b(có\s+sẵn\s+không|hình\s+thức\s+ra\s+sao)\b'
+
+  # --- Tóm tắt / tóm lược (ưu tiên trước nhóm giải thích chung) ---
+  - intent_id: tom_tat_van_ban
+    priority: 94
+    confidence: 0.95
+    patterns:
+      - '(?i)\b(tóm\s*tắt|tóm\s*lược|khái\s*quát|tổng\s*quan)\b.{0,40}\b(nội\s*dung|điểm|quy\s*định|quyền\s+lợi)\b'
+      - '(?i)\bnội\s+dung\s+chính\s+của\b'
+      - '(?i)\b(cho|giúp)\s+tôi\s+tóm\s*tắt\b'
+      - '(?i)\btóm\s*tắt\s+những\s+quy\s*định\s+chính\b'
+      - '(?i)\btóm\s*tắt\s+cấu\s*trúc\b'
+      - '(?i)\bcác\s+cột\s+cần\s+có\b'
+      - '(?i)(tóm\s*tắt|tổng\s*hợp|khái\s*quát).{0,40}(nghị\s*định|luật|thông\s*tư|quyết\s*định|chỉ\s*thị|văn\s*bản)'
+
+  # --- Admin scenario cues (high-priority) ---
+  - intent_id: admin_planning
+    priority: 97
+    confidence: 0.94
+    patterns:
+      - '(?i)\b(thôn|xã|phường|ubnd\s*xã|thôn\s*trưởng)\b.{0,90}\b(xử\s*lý|can\s*thiệp|chỉ\s*đạo|giải\s*quyết)\b'
+      - '(?i)\b(cơ\s*quan\s+nào|ai)\s+(xử\s*lý|giải\s*quyết)\b'
+      - '(?i)\b(ubnd\s*(cấp\s*)?xã|xã|phường)\b.{0,80}\b(tiếp\s*nhận|nhận\s*được)\b.{0,80}\b(phản\s*ánh|đơn|hồ\s*sơ)\b'
+      - '(?i)\b(ubnd\s*(cấp\s*)?xã|xã|phường)\b.{0,100}\b(phối\s*hợp|chuyển\s*cơ\s*quan|chuyển\s*hồ\s*sơ)\b'
+      - '(?i)\b(xã\s*tôi|thôn\s*tôi)\b.{0,80}\b(cần|phải)\b.{0,30}\b(làm\s*gì|xử\s*lý)\b'
+      - '(?i)\b(ra\s+xã|lên\s+xã)\b.{0,80}\b(được\s+không|xử\s*lý|giải\s+quyết)\b'
+      - '(?i)\bông\/bà\b.{0,140}\b(giải\s*thích|hướng\s*dẫn|chỉ\s*đạo|tham\s*mưu|đề\s*xuất|xây\s*dựng\s*kế\s*hoạch)\b'
+      - '(?i)\b(đảng\s*ủy|hđnd\s*xã|ubnd\s*xã)\b.{0,120}\b(kế\s*hoạch|nghị\s*quyết|biện\s*pháp)\b'
+      - '(?i)\bmâu\s*thuẫn.{0,60}(quy\s*hoạch|kế\s*hoạch)\b'
+      - '(?i)\bkiểm\s*tra\s+liên\s*ngành\b.{0,120}\b(phối\s*hợp|xử\s*lý|quản\s*lý)\b'
+      - '(?i)\bnhóm\s+người\s+lạ\s*mặt\b.{0,120}\b(trái\s*phép|an\s*ninh\s*trật\s*tự|tôn\s*giáo)\b'
+      - '(?i)\b(người\s*dân|hộ\s*gia\s*đình)\b.{0,100}(phàn\s*nàn|phản\s*ánh|không\s*tuân\s*thủ|bị\s*bỏ\s*mặc)'
+      - '(?i)\b(thôn|xã)\b.{0,80}(phải|cần)\s+(làm\s*gì|xử\s*lý\s+thế\s+nào|can\s*thiệp)'
+      - '(?i)\b(kế\s*hoạch|phương\s*án|phân\s*bổ)\b.{0,50}(quản\s*lý|nhân\s*sự|địa\s*bàn|triển\s*khai)'
 
   # --- Thủ tục / hồ sơ / mẫu / UBND (gộp thu_tuc_hanh_chinh → huong_dan_thu_tuc) ---
   - intent_id: huong_dan_thu_tuc
@@ -59,10 +107,17 @@ structural_rules:
     patterns:
       - '(hướng\s*dẫn|chỉ\s*dẫn).{0,80}(thủ\s*tục|hồ\s*sơ|nộp|mẫu)'
       - '(thủ\s*tục|quy\s*trình|trình\s*tự).{0,60}(nộp\s*hồ\s*sơ|mẫu\s*đơn|ở\s+đâu|thời\s*hạn|mấy\s*ngày)'
+      - '(?i)\b(làm|xin\s*cấp)\s*sổ\s*đỏ\b.{0,50}\b(cần|phải)\b.{0,30}\b(giấy\s*tờ|hồ\s*sơ)\b'
+      - '(?i)\bthành\s*lập\b.{0,40}\b(quỹ\s*từ\s*thiện|quỹ\s*xã\s*hội)\b.{0,70}\b(cần|phải)\b.{0,30}\b(làm\s+gì|thủ\s*tục|hồ\s*sơ)\b'
+      - '(?i)\b(cần|phải)\b.{0,20}\b(làm\s+những\s+gì|chuẩn\s*bị\s+gì)\b.{0,50}\b(thành\s*lập|đăng\s*ký|xin\s*phép|cấp\s*phép)\b'
       - '(mẫu\s*đơn|mẫu\s*công\s*văn|biểu\s*mẫu)'
       - 'nộp\s+(hồ\s*sơ|đơn).{0,40}(ở\s+đâu|tại\s+đâu|qua\s+đâu)'
       - '(một\s*cửa|dịch\s*vụ\s*công|tthc|thủ\s*tục\s*hành\s*chính)'
       - '(đăng\s*ký|xin\s*phép|cấp\s*phép).{0,50}(lễ\s*hội|di\s*tích|tôn\s*giáo|biểu\s*diễn)'
+      - '(cần|phải)\s+(những|các)\s+(giấy\s*tờ|hồ\s*sơ)\s+gì'
+      - 'hồ\s*sơ\s+(gồm|bao\s+gồm)\s+những\s+gì'
+      - '(gồm|bao\s+gồm)\s+những\s+bước'
+      - 'quy\s*trình\s+xử\s*lý'
   # Trình tự / thủ tục thành lập, công nhận, đăng ký — patterns còn thiếu coverage
   - intent_id: huong_dan_thu_tuc
     priority: 91
@@ -91,19 +146,12 @@ structural_rules:
     patterns:
       - '(sửa\s*đổi|bổ\s*sung|thay\s*thế|bãi\s*bỏ|hướng\s*dẫn\s*thi\s*hành|mối\s*quan\s*hệ).{0,40}(văn\s*bản|luật|nghị\s*định)'
 
-  - intent_id: tom_tat_van_ban
-    priority: 89
-    confidence: 0.95
-    patterns:
-      - '(tóm\s*tắt|tổng\s*hợp|khái\s*quát)\s+(nghị\s*định|luật|thông\s*tư|quyết\s*định|chỉ\s*thị)'
-      - 'tóm\s*tắt\s+(nội\s*dung|quy\s*định|văn\s*bản|các\s*quy\s*định|toàn\s*bộ)'
-      - 'tóm\s*tắt.{0,25}(nghị\s*định|thông\s*tư|quyết\s*định|chỉ\s*thị)'
-
   - intent_id: so_sanh_van_ban
     priority: 88
     confidence: 0.95
     patterns:
       - 'so\s*sánh\s+.{0,30}(luật|nghị\s*định|thông\s*tư).{0,30}(và|với|so\s*với)'
+      - 'so\s*sánh.{0,120}(và|với|so\s*với)'
   - intent_id: so_sanh_van_ban
     priority: 87
     confidence: 0.94
@@ -116,6 +164,12 @@ structural_rules:
     patterns:
       - '(soạn|viết)\s+(công\s*văn|tờ\s*trình|biên\s*bản|quyết\s*định|thông\s*báo|đơn\s*xin)'
       - '(lập|tạo)\s+(công\s*văn|tờ\s*trình|quyết\s*định|thông\s*báo|đơn\s*xin)'
+      - '(soạn|tạo|viết|lập)\s+mẫu'
+      - '(lập|soạn)\s+khung'
+      - 'khung\s+checklist'
+      - '(dàn\s+ý|khung)\s+báo\s+cáo'
+      - 'mẫu\s+(đơn|biểu|tờ\s+khai|quyết\s+định|thông\s+báo|công\s+văn)'
+      - 'dạng\s+bảng'
 
   - intent_id: tao_bao_cao
     priority: 85
@@ -158,7 +212,8 @@ structural_rules:
     priority: 79
     confidence: 0.92
     patterns:
-      - '(được\s*hiểu|giải\s*thích|khái\s*niệm|là\s*gì|áp\s*dụng\s+như\s*thế\s*nào)'
+      - '(được\s*hiểu|giải\s*thích|khái\s*niệm|áp\s*dụng\s+như\s*thế\s*nào)'
+      - '(?i)\b(khái\s*niệm|định\s*nghĩa|quy\s*định)\b.{0,30}\blà\s*gì\b'
   - intent_id: giai_thich_quy_dinh
     priority: 78
     confidence: 0.91
@@ -181,6 +236,17 @@ structural_rules:
     patterns:
       - '(thanh\s*tra|kiểm\s*tra).*(định\s*kỳ|đột\s*xuất|cơ\s*sở|chấp\s*hành)'
 
+  # --- Tình huống quản trị cấp xã/phường (đẩy về admin_scenario) ---
+  - intent_id: admin_planning
+    priority: 4
+    confidence: 0.93
+    patterns:
+      - '(?!)'
+      - '(?!)'
+      - '(?!)'
+      - '(?!)'
+      - '(?!)'
+
   - intent_id: xu_ly_vi_pham_hanh_chinh
     priority: 74
     confidence: 0.93
@@ -191,6 +257,7 @@ structural_rules:
       - 'bị\s+(xử\s*phạt|xử\s*lý|phạt)\s*(thế\s*nào|như\s+thế\s+nào|ra\s+sao)?'
       # "hành vi ... bị xử ..." / "áp dụng cho vi phạm nào"
       - 'hành\s*vi.{0,80}(bị\s+xử\s*(phạt|lý)|vi\s*phạm\s+nào|áp\s*dụng\s+cho\s+vi\s*phạm)'
+      - '(?i)\bcó\s*thể\s*bị\s*(xem\s*là|yêu\s*cầu\s*bổ\s*sung|không\s*đạt\s*điều\s*kiện)\b'
 
   - intent_id: hoa_giai_van_dong
     priority: 73
@@ -205,10 +272,10 @@ structural_rules:
       - '(tổ\s*chức|chuẩn\s*bị).*(sự\s*kiện|lễ\s*hội|ngày\s*hội|đại\s*hội)'
 
   - intent_id: admin_planning
-    priority: 71
+    priority: 3
     confidence: 0.88
     patterns:
-      - '(kế\s*hoạch|phương\s*án|phân\s*bổ).{0,40}(quản\s*lý|nhân\s*sự|địa\s*bàn|triển\s*khai)'
+      - '(?!)'
 
   - intent_id: tra_cuu_van_ban
     priority: 70
@@ -345,3 +412,62 @@ prototype_sentences:
   tra_cuu_van_ban:
     - "Văn bản nào quy định về quản lý lễ hội dân gian?"
     - "Có những nghị định nào về quảng cáo hiện hành?"
+
+# Override cờ RAG theo pattern (áp dụng sau map/sync) để dễ audit/versioning.
+flag_overrides:
+  - name: structured_summary_single_source
+    patterns:
+      - '(?i)(tóm\s*tắt|tóm\s*lược).{0,80}(cấu\s*trúc|các\s*cột|báo\s*cáo)'
+    set_flags:
+      is_legal_lookup: false
+      use_multi_article: false
+      needs_expansion: false
+
+  - name: structured_drafting_single_source
+    patterns:
+      - '(?i)(lập|soạn|khung|checklist).{0,80}(cấu\s*trúc|các\s*cột|báo\s*cáo)'
+    set_flags:
+      is_legal_lookup: false
+      use_multi_article: false
+      needs_expansion: true
+
+  - name: explain_mandatory_dossier_doc
+    patterns:
+      - '(?i)giải\s*thích.{0,80}(tài\s*liệu\s*bắt\s*buộc|bắt\s*buộc\s+trong\s+hồ\s*sơ)'
+    set_flags:
+      is_legal_lookup: false
+      use_multi_article: false
+      needs_expansion: true
+
+  - name: violation_invalid_eligibility_for_establishment
+    patterns:
+      - '(?i)không\s+đáp\s+ứng.{0,40}điều\s*kiện.{0,40}(thành\s*lập|hoạt\s*động)'
+    set_flags:
+      is_legal_lookup: true
+      use_multi_article: false
+      needs_expansion: false
+
+  - name: violation_missing_commitment_or_supplement
+    patterns:
+      - '(?i)(yêu\s*cầu\s*bổ\s*sung|không\s*đạt\s*điều\s*kiện\s*xét)'
+    set_flags:
+      is_legal_lookup: false
+      use_multi_article: false
+      needs_expansion: true
+
+  - name: legal_lookup_broad_statute_qa
+    patterns:
+      - '(?i)thời\s*hiệu\s+xử\s*phạt\s+vi\s*phạm\s+hành\s*chính'
+      - '(?i)ngành.{0,20}nghề.{0,40}ưu\s*đãi\s*đầu\s*tư.{0,60}địa\s*bàn\s+ưu\s*đãi\s*đầu\s*tư'
+    set_flags:
+      is_legal_lookup: false
+      use_multi_article: false
+      needs_expansion: false
+
+  - name: public_investment_classification_criteria
+    patterns:
+      - '(?i)tiêu\s*chí\s+phân\s*loại.{0,40}dự\s*án\s*đầu\s*tư\s*công'
+    set_flags:
+      is_legal_lookup: false
+      use_multi_article: true
+      needs_expansion: false

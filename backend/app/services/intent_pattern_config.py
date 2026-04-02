@@ -28,6 +28,7 @@ def _resolved_yaml_path(explicit: Optional[Path]) -> Path:
 # (intent_id, confidence, tuple of compiled patterns) — đã sắp theo priority giảm dần
 _structural_rules: List[Tuple[str, float, Tuple[re.Pattern[str], ...]]] = []
 _routing_compiled: Dict[str, List[re.Pattern[str]]] = {}
+_flag_overrides: List[Dict[str, object]] = []
 _prototype_sentences: Dict[str, List[str]] = {}
 _loaded = False
 
@@ -103,7 +104,7 @@ def load_intent_pattern_config(
     force: bool = False,
 ) -> None:
     """Load YAML một lần; gọi từ startup hoặc test (force=True)."""
-    global _structural_rules, _routing_compiled, _prototype_sentences, _loaded
+    global _structural_rules, _routing_compiled, _flag_overrides, _prototype_sentences, _loaded
 
     if _loaded and not force:
         return
@@ -113,6 +114,7 @@ def load_intent_pattern_config(
     structural_raw: List[dict] = []
     routing_raw: Dict[str, List[str]] = {}
     proto_raw: Dict[str, List[str]] = {}
+    flag_raw: List[dict] = []
 
     try:
         import yaml  # type: ignore
@@ -129,12 +131,14 @@ def load_intent_pattern_config(
             routing_raw = {k: list(v) for k, v in rr.items() if isinstance(v, list)}
             pr = data.get("prototype_sentences") or {}
             proto_raw = {k: list(v) for k, v in pr.items() if isinstance(v, list)}
+            flag_raw = list(data.get("flag_overrides") or [])
             log.info("Loaded intent patterns from %s", yaml_path)
         except Exception as exc:
             log.error("Failed to load %s: %s — built-in fallback", yaml_path, exc)
             structural_raw = []
             routing_raw = {}
             proto_raw = {}
+            flag_raw = []
 
     if not structural_raw:
         structural_raw = _builtin_structural()
@@ -168,8 +172,42 @@ def load_intent_pattern_config(
 
     _structural_rules = built_struct
     _routing_compiled = _compile_routing(routing_raw) if routing_raw else _default_routing_compiled()
+    _flag_overrides = _compile_flag_overrides(flag_raw)
     _prototype_sentences = {k: [str(s) for s in v if s] for k, v in proto_raw.items()}
     _loaded = True
+
+
+def _compile_flag_overrides(raw: List[dict]) -> List[Dict[str, object]]:
+    compiled: List[Dict[str, object]] = []
+    for row in raw or []:
+        if not isinstance(row, dict):
+            continue
+        patterns = [str(p).strip() for p in (row.get("patterns") or []) if str(p).strip()]
+        if not patterns:
+            continue
+        set_flags = row.get("set_flags") or {}
+        if not isinstance(set_flags, dict):
+            continue
+        cpatterns: List[re.Pattern[str]] = []
+        for p in patterns:
+            try:
+                cpatterns.append(re.compile(p, re.IGNORECASE))
+            except re.error as exc:
+                log.warning("Skip invalid flag override pattern: %s — %s", p[:80], exc)
+        if not cpatterns:
+            continue
+        compiled.append(
+            {
+                "name": str(row.get("name") or "").strip(),
+                "patterns": tuple(cpatterns),
+                "set_flags": {
+                    "is_legal_lookup": bool(set_flags.get("is_legal_lookup", False)),
+                    "use_multi_article": bool(set_flags.get("use_multi_article", False)),
+                    "needs_expansion": bool(set_flags.get("needs_expansion", False)),
+                },
+            }
+        )
+    return compiled
 
 
 def _default_routing_compiled() -> Dict[str, List[re.Pattern[str]]]:
@@ -248,3 +286,16 @@ def get_prototype_sentences_extra() -> Dict[str, List[str]]:
     """Câu prototype thêm từ YAML (merge vào INTENT_PROTOTYPES)."""
     load_intent_pattern_config()
     return dict(_prototype_sentences)
+
+
+def get_flag_override_set_flags(query: str) -> Optional[Dict[str, bool]]:
+    """Trả set_flags của override đầu tiên khớp query; None nếu không khớp."""
+    load_intent_pattern_config()
+    q = (query or "").lower()
+    if not q:
+        return None
+    for row in _flag_overrides:
+        pats = row.get("patterns") or ()
+        if any(p.search(q) for p in pats):  # type: ignore[attr-defined]
+            return dict(row.get("set_flags") or {})
+    return None

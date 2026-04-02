@@ -146,7 +146,7 @@ class Example:
 
 def _summarize_flags(bundles: List[Dict[str, Any]]) -> Dict[str, Any]:
     key_counts: Dict[str, Counter] = {}
-    for k in ("is_scenario", "is_legal_lookup", "use_multi_article", "needs_expansion"):
+    for k in ("is_legal_lookup", "use_multi_article", "needs_expansion"):
         c = Counter()
         for b in bundles:
             rf = b.get("rag_flags") or {}

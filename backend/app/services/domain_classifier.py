@@ -226,6 +226,11 @@ _DOMAIN_KEYWORDS: Dict[str, List[str]] = {
     "an_sinh": [
         "bảo trợ xã hội",
         "an sinh",
+        "trợ giúp xã hội",
+        "hoạt động trợ giúp",
+        "đăng ký hoạt động trợ giúp xã hội",
+        "điều kiện hoạt động trợ giúp xã hội",
+        "cơ sở trợ giúp xã hội",
         "người cao tuổi",
         "người khuyết tật",
         "trẻ em",
@@ -246,6 +251,7 @@ _DOMAIN_KEYWORDS: Dict[str, List[str]] = {
     "hanh_chinh": [
         "hành chính", "thủ tục", "một cửa", "công chức", "viên chức",
         "cải cách hành chính",
+        "đăng ký hoạt động", "cấp giấy phép", "hồ sơ đăng ký",
     ],
 }
 
@@ -460,9 +466,6 @@ def get_domain_filter_values(query: str) -> Optional[List[str]]:
     domains = classify_query_domain(query, top_n=3)
 
     confident = [d for d in domains if d["confidence"] >= 0.60 and d["domain"] != "chung"]
-    if confident:
-        return [d["domain"] for d in confident[:2]]
-
     keyword_strong = [
         d
         for d in domains
@@ -470,7 +473,24 @@ def get_domain_filter_values(query: str) -> Optional[List[str]]:
         and d["confidence"] >= 0.50
         and d["domain"] != "chung"
     ]
-    if keyword_strong:
-        return [d["domain"] for d in keyword_strong[:2]]
+    if confident:
+        filt = [d["domain"] for d in confident[:2]]
+    elif keyword_strong:
+        filt = [d["domain"] for d in keyword_strong[:2]]
+    else:
+        return None
 
-    return None
+    qlow = (query or "").lower()
+    # Đăng ký / điều kiện trợ giúp xã hội: vừa an sinh vừa thủ tục HC — một domain dễ làm vector=0.
+    if (
+        "hanh_chinh" not in filt
+        and (
+            "trợ giúp xã hội" in qlow
+            or "hoạt động trợ giúp" in qlow
+            or ("trợ giúp" in qlow and "đăng ký" in qlow)
+        )
+    ):
+        filt = list(filt)
+        filt.append("hanh_chinh")
+
+    return filt[:3]
